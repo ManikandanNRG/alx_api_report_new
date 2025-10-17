@@ -15,7 +15,7 @@
 // along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
 
 /**
- * Auto-sync status monitoring page for ALX Report API plugin.
+ * Auto-sync Intelligence Dashboard for ALX Report API plugin.
  *
  * @package    local_alx_report_api
  * @copyright  2024 ALX Report API Plugin
@@ -24,17 +24,30 @@
 
 require_once('../../config.php');
 require_once($CFG->libdir.'/adminlib.php');
-require_once($CFG->dirroot.'/local/alx_report_api/lib.php');
+require_once(__DIR__ . '/lib.php');
 
 // Check permissions.
 admin_externalpage_setup('local_alx_report_api_auto_sync_status');
 require_capability('moodle/site:config', context_system::instance());
 
 $PAGE->set_url('/local/alx_report_api/auto_sync_status.php');
-$PAGE->set_title('Auto-Sync Status - ALX Report API');
-$PAGE->set_heading('Auto-Sync Status Monitoring');
+$PAGE->set_title('Auto-Sync Intelligence - ALX Report API');
+$PAGE->set_heading('Auto-Sync Intelligence Dashboard');
+
+// Add dedicated CSS file for auto-sync monitoring
+$PAGE->requires->css('/local/alx_report_api/auto_sync_monitoring.css');
+
+// Include modern font and icons
+echo '<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">';
+echo '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">';
+
+// Include Chart.js for interactive charts
+echo '<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>';
 
 echo $OUTPUT->header();
+
+// Get LIVE DATA from database - NO PLACEHOLDERS
+global $DB;
 
 // Get current configuration
 $sync_hours = get_config('local_alx_report_api', 'auto_sync_hours') ?: 1;
@@ -42,200 +55,377 @@ $max_sync_time = get_config('local_alx_report_api', 'max_sync_time') ?: 300;
 $last_sync = get_config('local_alx_report_api', 'last_auto_sync');
 $last_stats = get_config('local_alx_report_api', 'last_sync_stats');
 
-// Get scheduled task info
-global $DB;
+// Parse last sync statistics - LIVE DATA
+$sync_statistics = [];
+if ($last_stats) {
+    $sync_statistics = json_decode($last_stats, true) ?: [];
+}
+
+// Get scheduled task info - LIVE DATA
 $task_record = $DB->get_record('task_scheduled', ['classname' => '\local_alx_report_api\task\sync_reporting_data_task']);
 
-echo '<div class="container-fluid">';
-echo '<div class="row">';
-
-// Configuration Status
-echo '<div class="col-md-6">';
-echo '<div class="card mb-4">';
-echo '<div class="card-header bg-primary text-white">';
-echo '<h4 class="card-title mb-0">⚙️ Configuration Status</h4>';
-echo '</div>';
-echo '<div class="card-body">';
-
-echo '<table class="table table-striped">';
-echo '<tr><td><strong>Sync Interval:</strong></td><td>Every hour (at minute 0)</td></tr>';
-echo '<tr><td><strong>Look-back Period:</strong></td><td>' . $sync_hours . ' hour(s)</td></tr>';
-echo '<tr><td><strong>Max Execution Time:</strong></td><td>' . $max_sync_time . ' seconds</td></tr>';
-
-if ($task_record) {
-    $status = $task_record->disabled ? 
-        '<span class="badge badge-danger">DISABLED</span>' : 
-        '<span class="badge badge-success">ENABLED</span>';
-    echo '<tr><td><strong>Task Status:</strong></td><td>' . $status . '</td></tr>';
-    
-    if ($task_record->nextruntime) {
-        $next_run = userdate($task_record->nextruntime, '%Y-%m-%d %H:%M:%S');
-        echo '<tr><td><strong>Next Scheduled Run:</strong></td><td>' . $next_run . '</td></tr>';
+// Get system health data - LIVE DATA
+$companies = local_alx_report_api_get_companies();
+$total_companies = count($companies);
+$companies_with_api = 0;
+foreach ($companies as $company) {
+    if ($DB->record_exists(\local_alx_report_api\constants::TABLE_SETTINGS, ['companyid' => $company->id])) {
+        $companies_with_api++;
     }
-    
-    if ($task_record->lastruntime) {
-        $last_run = userdate($task_record->lastruntime, '%Y-%m-%d %H:%M:%S');
-        echo '<tr><td><strong>Last Run:</strong></td><td>' . $last_run . '</td></tr>';
-    }
-} else {
-    echo '<tr><td><strong>Task Status:</strong></td><td><span class="badge badge-warning">NOT FOUND</span></td></tr>';
 }
 
-echo '</table>';
-echo '</div>';
-echo '</div>';
-echo '</div>';
-
-// Last Sync Statistics
-echo '<div class="col-md-6">';
-echo '<div class="card mb-4">';
-echo '<div class="card-header bg-success text-white">';
-echo '<h4 class="card-title mb-0">📊 Last Sync Statistics</h4>';
-echo '</div>';
-echo '<div class="card-body">';
-
-if ($last_sync && $last_stats) {
-    $stats = json_decode($last_stats, true);
-    $sync_time = userdate($last_sync, '%Y-%m-%d %H:%M:%S');
-    
-    echo '<p><strong>Last Sync:</strong> ' . $sync_time . '</p>';
-    echo '<table class="table table-striped">';
-    echo '<tr><td><strong>Companies Processed:</strong></td><td>' . ($stats['companies_processed'] ?? 0) . '</td></tr>';
-    echo '<tr><td><strong>Users Updated:</strong></td><td>' . ($stats['total_users_updated'] ?? 0) . '</td></tr>';
-    echo '<tr><td><strong>Records Updated:</strong></td><td>' . ($stats['total_records_updated'] ?? 0) . '</td></tr>';
-    echo '<tr><td><strong>Records Created:</strong></td><td>' . ($stats['total_records_created'] ?? 0) . '</td></tr>';
-    
-    $error_count = $stats['total_errors'] ?? 0;
-    if ($error_count > 0) {
-        echo '<tr><td><strong>Errors:</strong></td><td><span class="badge badge-danger">' . $error_count . '</span></td></tr>';
-        if (!empty($stats['companies_with_errors'])) {
-            echo '<tr><td><strong>Companies with Errors:</strong></td><td>' . implode(', ', $stats['companies_with_errors']) . '</td></tr>';
+// Get historical sync data (last 7 days) - LIVE DATA
+$historical_data = [];
+if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_SYNC_STATUS)) {
+    try {
+        // Check what columns exist in the table
+        $table_info = $DB->get_columns(\local_alx_report_api\constants::TABLE_SYNC_STATUS);
+        $has_last_sync_status = isset($table_info['last_sync_status']);
+        $has_last_sync_timestamp = isset($table_info['last_sync_timestamp']);
+        
+        if ($has_last_sync_timestamp) {
+            // Get daily sync counts for the last 7 days
+            for ($i = 6; $i >= 0; $i--) {
+                $day_start = time() - ($i * 24 * 3600);
+                $day_end = $day_start + (24 * 3600);
+                
+                $daily_syncs = $DB->count_records_select(\local_alx_report_api\constants::TABLE_SYNC_STATUS, 
+                    'last_sync_timestamp >= ? AND last_sync_timestamp < ?', 
+                    [$day_start, $day_end]);
+                
+                $successful_syncs = 0;
+                if ($has_last_sync_status) {
+                    $successful_syncs = $DB->count_records_select(\local_alx_report_api\constants::TABLE_SYNC_STATUS, 
+                        'last_sync_timestamp >= ? AND last_sync_timestamp < ? AND last_sync_status = ?', 
+                        [$day_start, $day_end, 'success']);
+                } else {
+                    // If no status column, assume all syncs are successful
+                    $successful_syncs = $daily_syncs;
+                }
+                
+                $historical_data[] = [
+                    'date' => date('M j', $day_start),
+                    'total_syncs' => $daily_syncs,
+                    'successful_syncs' => $successful_syncs,
+                    'success_rate' => $daily_syncs > 0 ? round(($successful_syncs / $daily_syncs) * 100) : 0
+                ];
+            }
         }
-    } else {
-        echo '<tr><td><strong>Errors:</strong></td><td><span class="badge badge-success">0</span></td></tr>';
+    } catch (Exception $e) {
+        error_log('Auto-sync status query error: ' . $e->getMessage());
+        // Initialize empty historical data on error
+        for ($i = 6; $i >= 0; $i--) {
+            $day_start = time() - ($i * 24 * 3600);
+            $historical_data[] = [
+                'date' => date('M j', $day_start),
+                'total_syncs' => 0,
+                'successful_syncs' => 0,
+                'success_rate' => 0
+            ];
+        }
     }
-    echo '</table>';
-} else {
-    echo '<div class="alert alert-info">';
-    echo '<strong>No sync data available yet.</strong><br>';
-    echo 'The automatic sync task has not run yet or no statistics are available.';
-    echo '</div>';
 }
 
-echo '</div>';
-echo '</div>';
-echo '</div>';
-
-echo '</div>'; // End row
-
-// System Status
-echo '<div class="row">';
-echo '<div class="col-12">';
-echo '<div class="card mb-4">';
-echo '<div class="card-header bg-info text-white">';
-echo '<h4 class="card-title mb-0">🔧 System Status & Actions</h4>';
-echo '</div>';
-echo '<div class="card-body">';
-
-// Check if cron is running
+// Check cron health - LIVE DATA
 $last_cron = get_config('tool_task', 'lastcronstart');
-$cron_status = '';
+$cron_healthy = false;
 if ($last_cron) {
     $time_since_cron = time() - $last_cron;
-    if ($time_since_cron < 3600) { // Less than 1 hour
-        $cron_status = '<span class="badge badge-success">RUNNING (last run ' . format_time($time_since_cron) . ' ago)</span>';
-    } else {
-        $cron_status = '<span class="badge badge-warning">DELAYED (last run ' . format_time($time_since_cron) . ' ago)</span>';
-    }
-} else {
-    $cron_status = '<span class="badge badge-danger">NOT RUNNING</span>';
+    $cron_healthy = $time_since_cron < 3600;
 }
 
-echo '<div class="row">';
-echo '<div class="col-md-6">';
-echo '<h5>System Health</h5>';
-echo '<table class="table table-striped">';
-echo '<tr><td><strong>Moodle Cron Status:</strong></td><td>' . $cron_status . '</td></tr>';
+// Calculate next sync time - LIVE DATA
+$next_sync_time = null;
+if ($task_record && $last_sync) {
+    $next_sync_time = $last_sync + ($sync_hours * 3600);
+}
 
-// Check reporting table status
-$total_reporting_records = $DB->count_records('local_alx_api_reporting');
-echo '<tr><td><strong>Reporting Table Records:</strong></td><td>' . number_format($total_reporting_records) . '</td></tr>';
+?>
 
-// Check cache table status
-$total_cache_records = $DB->count_records('local_alx_api_cache');
-echo '<tr><td><strong>Cache Table Records:</strong></td><td>' . number_format($total_cache_records) . '</td></tr>';
+<div class="auto-sync-container">
+    
+    <!-- ROW 1: HEADER SECTION -->
+    <div class="header-section">
+        <div class="header-content">
+            <div>
+                <h1 class="header-title">🔄 Auto-Sync Intelligence</h1>
+                <p class="header-subtitle">Monitor automated data synchronization across all company tenants</p>
+            </div>
+            <a href="control_center.php" class="back-button">
+                <i class="fas fa-arrow-left"></i>
+                Back to Control Center
+            </a>
+        </div>
+    </div>
 
-echo '</table>';
-echo '</div>';
+    <!-- ROW 2: SYNC STATISTICS CARDS (8 cards - 4x2 grid) -->
+    <div class="stats-grid">
+        <!-- First Row -->
+        <div class="stat-card success">
+            <div class="stat-value"><?php echo $sync_statistics['companies_processed'] ?? 0; ?></div>
+            <div class="stat-label">Companies Processed</div>
+        </div>
+        <div class="stat-card info">
+            <div class="stat-value"><?php echo $sync_statistics['total_users_updated'] ?? 0; ?></div>
+            <div class="stat-label">Users Updated</div>
+        </div>
+        <div class="stat-card info">
+            <div class="stat-value"><?php echo $sync_statistics['total_records_updated'] ?? 0; ?></div>
+            <div class="stat-label">Records Updated</div>
+        </div>
+        <div class="stat-card info">
+            <div class="stat-value"><?php echo $sync_statistics['total_records_created'] ?? 0; ?></div>
+            <div class="stat-label">Records Created</div>
+        </div>
+        
+        <!-- Second Row -->
+        <div class="stat-card <?php echo ($sync_statistics['total_errors'] ?? 0) > 0 ? 'danger' : 'success'; ?>">
+            <div class="stat-value"><?php echo $sync_statistics['total_errors'] ?? 0; ?></div>
+            <div class="stat-label">Errors</div>
+        </div>
+        <div class="stat-card <?php echo $cron_healthy ? 'success' : 'warning'; ?>">
+            <div class="stat-value"><?php echo $last_sync ? date('H:i', $last_sync) : 'Never'; ?></div>
+            <div class="stat-label">Last Sync</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value"><?php 
+                if ($next_sync_time) {
+                    echo date('H:i', $next_sync_time);
+                } else {
+                    echo 'Pending';
+                }
+            ?></div>
+            <div class="stat-label">Next Sync</div>
+        </div>
+        <div class="stat-card <?php echo $task_record && $task_record->disabled == 0 ? 'success' : 'danger'; ?>">
+            <div class="stat-value"><?php echo $task_record && $task_record->disabled == 0 ? 'Active' : 'Disabled'; ?></div>
+            <div class="stat-label">Task Status</div>
+        </div>
+    </div>
 
-echo '<div class="col-md-6">';
-echo '<h5>Quick Actions</h5>';
-echo '<div class="btn-group-vertical" style="width: 100%;">';
+    <!-- ROW 3: SYNC TRENDS CHART (50% + 50%) -->
+    <div class="chart-section">
+        <div class="chart-header">
+            <h3 class="chart-title">
+                <i class="fas fa-chart-area"></i>
+                📊 Weekly Sync Trends & Last Sync Statistics
+            </h3>
+            <p class="chart-subtitle">Interactive chart showing sync performance over the last 7 days with detailed statistics</p>
+        </div>
+        <div class="chart-body">
+            <div class="chart-grid">
+                <!-- Left Side: Chart (50%) -->
+                <div class="chart-container">
+                    <canvas id="syncTrendsChart"></canvas>
+                </div>
+                
+                <!-- Right Side: Statistics (50%) -->
+                <div class="chart-stats">
+                    <h4>📈 Last Sync Statistics</h4>
+                    <div class="chart-stat-item">
+                        <span class="chart-stat-label">Total Syncs (7 days)</span>
+                        <span class="chart-stat-value"><?php echo array_sum(array_column($historical_data, 'total_syncs')); ?></span>
+                    </div>
+                    <div class="chart-stat-item">
+                        <span class="chart-stat-label">Successful Syncs</span>
+                        <span class="chart-stat-value"><?php echo array_sum(array_column($historical_data, 'successful_syncs')); ?></span>
+                    </div>
+                    <div class="chart-stat-item">
+                        <span class="chart-stat-label">Overall Success Rate</span>
+                        <span class="chart-stat-value"><?php 
+                            $total_syncs = array_sum(array_column($historical_data, 'total_syncs'));
+                            $successful_syncs = array_sum(array_column($historical_data, 'successful_syncs'));
+                            echo $total_syncs > 0 ? round(($successful_syncs / $total_syncs) * 100) . '%' : '0%';
+                        ?></span>
+                    </div>
+                    <div class="chart-stat-item">
+                        <span class="chart-stat-label">Avg Syncs/Day</span>
+                        <span class="chart-stat-value"><?php echo round(array_sum(array_column($historical_data, 'total_syncs')) / 7, 1); ?></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
 
-// Link to scheduled tasks management
-echo '<a href="' . $CFG->wwwroot . '/admin/tool/task/scheduledtasks.php" class="btn btn-primary mb-2">';
-echo '📅 Manage Scheduled Tasks</a>';
+    <!-- ROW 4: SYSTEM STATUS BANNER -->
+    <div class="status-banner <?php echo $cron_healthy ? '' : 'warning'; ?>">
+        <div class="status-content">
+            <div class="status-icon">
+                <?php echo $cron_healthy ? '✅' : '⚠️'; ?>
+            </div>
+            <div class="status-details">
+                <h3>Auto-Sync System Status: <?php echo $cron_healthy ? 'HEALTHY' : 'WARNING'; ?></h3>
+                <div class="status-meta">
+                    <?php if ($cron_healthy): ?>
+                        System is running normally and ready for automatic synchronization
+                    <?php else: ?>
+                        Warning: Cron system may need attention for optimal sync performance
+                    <?php endif; ?>
+                </div>
+                <div class="status-grid">
+                    <div class="status-item">
+                        <span class="status-label">Total Companies</span>
+                        <span class="status-value"><?php echo $total_companies; ?></span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">API Configured</span>
+                        <span class="status-value"><?php echo $companies_with_api; ?></span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Sync Interval</span>
+                        <span class="status-value"><?php echo $sync_hours; ?>h</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Max Sync Time</span>
+                        <span class="status-value"><?php echo $max_sync_time; ?>s</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
 
-// Link to task logs
-echo '<a href="' . $CFG->wwwroot . '/admin/tool/task/index.php" class="btn btn-info mb-2">';
-echo '📋 View Task Logs</a>';
+    <!-- ROW 5: TIMELINE PROCESS FLOW -->
+    <div class="timeline-section">
+        <div class="timeline-header">
+            <h3 class="timeline-title">🔄 Auto-Sync Process Flow</h3>
+        </div>
+        <div class="timeline-flow">
+            <div class="timeline-step">
+                <div class="timeline-icon">⏰</div>
+                <div class="timeline-label">
+                    <strong>Scheduled Execution</strong>
+                    <span>Cron-based trigger</span>
+                </div>
+            </div>
+            <div class="timeline-step">
+                <div class="timeline-icon">🏢</div>
+                <div class="timeline-label">
+                    <strong>Smart Company Detection</strong>
+                    <span>Identify active companies</span>
+                </div>
+            </div>
+            <div class="timeline-step">
+                <div class="timeline-icon">🔍</div>
+                <div class="timeline-label">
+                    <strong>Change Detection</strong>
+                    <span>Incremental updates</span>
+                </div>
+            </div>
+            <div class="timeline-step">
+                <div class="timeline-icon">🔄</div>
+                <div class="timeline-label">
+                    <strong>Data Update</strong>
+                    <span>Intelligent sync</span>
+                </div>
+            </div>
+        </div>
+    </div>
 
-// Link to manual sync
-echo '<a href="' . $CFG->wwwroot . '/local/alx_report_api/sync_reporting_data.php" class="btn btn-warning mb-2">';
-echo '🔄 Manual Sync</a>';
+    <!-- ROW 6: QUICK ACTIONS (4 buttons - 25% each) -->
+    <div class="actions-section">
+        <div class="actions-header">
+            <h3 class="actions-title">🚀 Quick Actions</h3>
+        </div>
+        <div class="actions-grid">
+            <a href="sync_reporting_data.php" class="action-button">
+                <div class="action-icon">🔄</div>
+                <div class="action-label">Manual Sync</div>
+            </a>
+            <a href="company_settings.php" class="action-button">
+                <div class="action-icon">⚙️</div>
+                <div class="action-label">Company Settings</div>
+            </a>
+            <a href="monitoring_dashboard.php" class="action-button">
+                <div class="action-icon">💚</div>
+                <div class="action-label">System Health & Alerts</div>
+            </a>
+            <a href="advanced_monitoring.php" class="action-button">
+                <div class="action-icon">🔒</div>
+                <div class="action-label">API Performance & Security</div>
+            </a>
+        </div>
+    </div>
 
-// Link to company settings
-echo '<a href="' . $CFG->wwwroot . '/local/alx_report_api/company_settings.php" class="btn btn-success mb-2">';
-echo '🏢 Company Settings</a>';
+</div>
 
-echo '</div>';
-echo '</div>';
-echo '</div>';
+<script>
+// Initialize Chart.js with LIVE DATA
+document.addEventListener('DOMContentLoaded', function() {
+    const ctx = document.getElementById('syncTrendsChart').getContext('2d');
+    
+    // LIVE DATA from PHP - NO PLACEHOLDERS
+    const chartData = {
+        labels: <?php echo json_encode(array_column($historical_data, 'date')); ?>,
+        datasets: [{
+            label: 'Total Syncs',
+            data: <?php echo json_encode(array_column($historical_data, 'total_syncs')); ?>,
+            backgroundColor: 'rgba(37, 99, 235, 0.1)',
+            borderColor: 'rgba(37, 99, 235, 1)',
+            borderWidth: 2,
+            fill: true,
+            tension: 0.4
+        }, {
+            label: 'Successful Syncs',
+            data: <?php echo json_encode(array_column($historical_data, 'successful_syncs')); ?>,
+            backgroundColor: 'rgba(16, 185, 129, 0.1)',
+            borderColor: 'rgba(16, 185, 129, 1)',
+            borderWidth: 2,
+            fill: true,
+            tension: 0.4
+        }]
+    };
+    
+    new Chart(ctx, {
+        type: 'line',
+        data: chartData,
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Weekly Sync Trends (Last 7 Days)',
+                    font: {
+                        size: 16,
+                        weight: 'bold'
+                    }
+                },
+                legend: {
+                    display: true,
+                    position: 'top'
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    grid: {
+                        color: 'rgba(0, 0, 0, 0.1)'
+                    },
+                    ticks: {
+                        stepSize: 1
+                    }
+                },
+                x: {
+                    grid: {
+                        color: 'rgba(0, 0, 0, 0.1)'
+                    }
+                }
+            },
+            interaction: {
+                intersect: false,
+                mode: 'index'
+            },
+            elements: {
+                point: {
+                    radius: 4,
+                    hoverRadius: 6
+                }
+            }
+        }
+    });
+});
+</script>
 
-echo '</div>';
-echo '</div>';
-echo '</div>';
-
-echo '</div>'; // End row
-
-// Instructions
-echo '<div class="row">';
-echo '<div class="col-12">';
-echo '<div class="card">';
-echo '<div class="card-header bg-dark text-white">';
-echo '<h4 class="card-title mb-0">📖 How It Works</h4>';
-echo '</div>';
-echo '<div class="card-body">';
-
-echo '<div class="row">';
-echo '<div class="col-md-6">';
-echo '<h5>Automatic Sync Process</h5>';
-echo '<ol>';
-echo '<li><strong>Scheduled Task:</strong> Runs every hour at minute 0 (e.g., 10:00, 11:00, 12:00)</li>';
-echo '<li><strong>Change Detection:</strong> Looks for course completions, module completions, and enrollment changes in the last ' . $sync_hours . ' hour(s)</li>';
-echo '<li><strong>Data Update:</strong> Updates the reporting table with fresh data from main database</li>';
-echo '<li><strong>Cache Clear:</strong> Clears old cache entries to ensure fresh API responses</li>';
-echo '<li><strong>Statistics:</strong> Logs performance statistics for monitoring</li>';
-echo '</ol>';
-echo '</div>';
-
-echo '<div class="col-md-6">';
-echo '<h5>Benefits</h5>';
-echo '<ul>';
-echo '<li><strong>Fresh Data:</strong> Reporting table stays up-to-date automatically</li>';
-echo '<li><strong>Fast API:</strong> API calls get fresh data from optimized reporting table</li>';
-echo '<li><strong>Efficient Caching:</strong> Cache expires hourly, ensuring balance between speed and freshness</li>';
-echo '<li><strong>No Manual Work:</strong> Completely automated - no human intervention needed</li>';
-echo '<li><strong>Multi-Company:</strong> Handles all companies automatically</li>';
-echo '</ul>';
-echo '</div>';
-echo '</div>';
-
-echo '</div>';
-echo '</div>';
-echo '</div>';
-
-echo '</div>'; // End row
-echo '</div>'; // End container
-
+<?php
 echo $OUTPUT->footer();
+?>

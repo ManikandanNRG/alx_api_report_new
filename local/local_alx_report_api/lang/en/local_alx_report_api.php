@@ -74,9 +74,11 @@ $string['field_lastname_desc'] = 'Include the user\'s last name in the response'
 $string['field_email'] = 'Email Address';
 $string['field_email_desc'] = 'Include the user\'s email address in the response';
 
+// User fields (continued).
+$string['field_username'] = 'Username';
+$string['field_username_desc'] = 'Include the user\'s username in the response';
+
 // Course fields.
-$string['field_courseid'] = 'Course ID';
-$string['field_courseid_desc'] = 'Include the numeric course ID in the response';
 $string['field_coursename'] = 'Course Name';
 $string['field_coursename_desc'] = 'Include the course name in the response';
 
@@ -132,7 +134,7 @@ $string['sync_reporting_data_task'] = 'Sync reporting data incrementally';
 $string['auto_sync_hours'] = 'Auto sync hours';
 $string['auto_sync_hours_desc'] = 'Number of hours to look back for changes during automatic sync (default: 1 hour)';
 $string['max_sync_time'] = 'Maximum sync execution time';
-$string['max_sync_time_desc'] = 'Maximum time in seconds for sync task execution (default: 300 seconds)';
+$string['max_sync_time_desc'] = 'Maximum time in seconds for sync task execution (default: 300 seconds)'; 
 
 // API Response Status Messages
 $string['api_no_data_full_sync'] = 'No course progress data found for this company. This could mean: 1) No users are enrolled in courses, 2) No course completions have occurred yet, 3) Reporting table needs to be populated with historical data, or 4) Company course settings exclude all courses.';
@@ -172,3 +174,32 @@ $string['health_score_threshold'] = 'Health Score Alert Threshold';
 $string['health_score_threshold_desc'] = 'Send alert when system health score drops below this value';
 $string['db_response_time_threshold'] = 'Database Response Time Alert Threshold';
 $string['db_response_time_threshold_desc'] = 'Send alert when database response time exceeds this value (in milliseconds)'; 
+
+// Scheduled task for alert monitoring
+$string['checkalertstask'] = 'Check system alerts and send notifications';
+
+// Email alert notification strings
+$string['alert_email_subject'] = 'ALX Report API Alert: {$a->severity} - {$a->type}';
+$string['alert_email_body'] = 'An alert has been triggered in the ALX Report API system.
+
+Alert Details:
+- Severity: {$a->severity}
+- Type: {$a->type}
+- Message: {$a->message}
+- Time: {$a->time}
+- Threshold: {$a->threshold}
+- Current Value: {$a->current_value}
+
+Please review the Control Center monitoring dashboard for more details.
+
+Dashboard URL: {$a->dashboard_url}
+
+This is an automated message from the ALX Report API monitoring system.';
+
+// Alert type descriptions
+$string['alert_type_api_usage'] = 'High API Usage';
+$string['alert_type_health_score'] = 'Low System Health Score';
+$string['alert_type_db_response'] = 'Slow Database Response';
+$string['alert_type_rate_limit'] = 'Rate Limit Exceeded';
+$string['alert_type_sync_failure'] = 'Data Sync Failure';
+$string['alert_type_system_error'] = 'System Error';

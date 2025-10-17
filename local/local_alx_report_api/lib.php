@@ -24,6 +24,13 @@
 
 defined('MOODLE_INTERNAL') || die();
 
+// Load constants class
+if (!class_exists('local_alx_report_api\constants')) {
+    require_once($CFG->dirroot . '/local/alx_report_api/classes/constants.php');
+}
+
+use local_alx_report_api\constants;
+
 /**
  * Extends the settings navigation with the ALX Report API settings
  *
@@ -96,11 +103,18 @@ function local_alx_report_api_validate_token($token) {
         return false;
     }
 
-    // Check if token is for our service.
+    // Check if token is for our service - check both service names for compatibility.
     $service = $DB->get_record('external_services', [
         'id' => $tokenrecord->externalserviceid,
-        'shortname' => 'alx_report_api',
+        'shortname' => 'alx_report_api_custom',
     ]);
+
+    if (!$service) {
+        $service = $DB->get_record('external_services', [
+            'id' => $tokenrecord->externalserviceid,
+            'shortname' => 'alx_report_api',
+        ]);
+    }
 
     if (!$service) {
         return false;
@@ -134,52 +148,72 @@ function local_alx_report_api_cleanup_logs($days = 90) {
 
     $cutoff = time() - ($days * 24 * 60 * 60);
     
-    if ($DB->get_manager()->table_exists('local_alx_api_logs')) {
-        return $DB->delete_records_select('local_alx_api_logs', 'timecreated < ?', [$cutoff]);
+    if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_LOGS)) {
+        return $DB->delete_records_select(\local_alx_report_api\constants::TABLE_LOGS, 'timecreated < ?', [$cutoff]);
     }
 
     return 0;
 }
 
 /**
- * Get API usage statistics for a company.
+ * Get usage statistics for a specific company.
  *
  * @param int $companyid Company ID
- * @param int $days Number of days to look back (default: 30)
+ * @param int $days Number of days to look back (default 30)
  * @return array Usage statistics
  */
 function local_alx_report_api_get_usage_stats($companyid, $days = 30) {
     global $DB;
 
-    $cutoff = time() - ($days * 24 * 60 * 60);
+    // Initialize with safe default values
     $stats = [
         'total_requests' => 0,
         'unique_users' => 0,
         'last_access' => 0,
     ];
 
-    if ($DB->get_manager()->table_exists('local_alx_api_logs')) {
-        // Total requests.
+    try {
+        // Check if logs table exists
+        if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_LOGS)) {
+            error_log('ALX Report API: local_alx_api_logs table does not exist');
+            return $stats;
+        }
+
+        // Get company shortname from company ID
+        $company = $DB->get_record('company', ['id' => $companyid], 'shortname');
+        if (!$company) {
+            error_log("ALX Report API: Company with ID {$companyid} not found");
+            return $stats;
+        }
+        
+        $company_shortname = $company->shortname;
+        $cutoff = time() - ($days * 24 * 3600);
+
+        // Query using company_shortname (current schema uses this field)
         $stats['total_requests'] = $DB->count_records_select(
-            'local_alx_api_logs',
-            'companyid = ? AND timecreated > ?',
-            [$companyid, $cutoff]
+            \local_alx_report_api\constants::TABLE_LOGS,
+            "company_shortname = ? AND timecreated > ?",
+            [$company_shortname, $cutoff]
         );
 
-        // Unique users.
+        // Unique users
         $sql = "SELECT COUNT(DISTINCT userid) 
                 FROM {local_alx_api_logs} 
-                WHERE companyid = ? AND timecreated > ?";
-        $stats['unique_users'] = $DB->count_records_sql($sql, [$companyid, $cutoff]);
+                WHERE company_shortname = ? AND timecreated > ?";
+        $stats['unique_users'] = $DB->count_records_sql($sql, [$company_shortname, $cutoff]);
 
-        // Last access.
+        // Last access
         $last_access = $DB->get_field_select(
-            'local_alx_api_logs',
-            'MAX(timecreated)',
-            'companyid = ?',
-            [$companyid]
+            \local_alx_report_api\constants::TABLE_LOGS,
+            "MAX(timecreated)",
+            'company_shortname = ?',
+            [$company_shortname]
         );
         $stats['last_access'] = $last_access ?: 0;
+
+    } catch (Exception $e) {
+        error_log('ALX Report API: Error getting usage stats - ' . $e->getMessage());
+        // Return safe default stats
     }
 
     return $stats;
@@ -193,11 +227,22 @@ function local_alx_report_api_get_usage_stats($companyid, $days = 30) {
 function local_alx_report_api_get_companies() {
     global $DB;
     
-    if ($DB->get_manager()->table_exists('company')) {
-        return $DB->get_records('company', null, 'name ASC', 'id, name, shortname');
+    try {
+        // Check if IOMAD company table exists
+        if (!$DB->get_manager()->table_exists('company')) {
+            error_log('ALX Report API: Company table does not exist. IOMAD may not be installed.');
+            return [];
+        }
+        
+        // Get all companies ordered by name
+        $companies = $DB->get_records('company', null, 'name ASC', 'id, name, shortname');
+        
+        return $companies ? $companies : [];
+        
+    } catch (Exception $e) {
+        error_log('ALX Report API: Error getting companies - ' . $e->getMessage());
+        return [];
     }
-    
-    return [];
 }
 
 /**
@@ -211,7 +256,7 @@ function local_alx_report_api_get_companies() {
 function local_alx_report_api_get_company_setting($companyid, $setting_name, $default = 0) {
     global $DB;
     
-    $setting = $DB->get_record('local_alx_api_settings', [
+    $setting = $DB->get_record(\local_alx_report_api\constants::TABLE_SETTINGS, [
         'companyid' => $companyid,
         'setting_name' => $setting_name
     ]);
@@ -232,11 +277,11 @@ function local_alx_report_api_set_company_setting($companyid, $setting_name, $se
     
     try {
         // Check if tables exist
-        if (!$DB->get_manager()->table_exists('local_alx_api_settings')) {
+        if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_SETTINGS)) {
             throw new Exception('Settings table does not exist. Please run plugin installation.');
         }
         
-        $existing = $DB->get_record('local_alx_api_settings', [
+        $existing = $DB->get_record(\local_alx_report_api\constants::TABLE_SETTINGS, [
             'companyid' => $companyid,
             'setting_name' => $setting_name
         ]);
@@ -247,7 +292,7 @@ function local_alx_report_api_set_company_setting($companyid, $setting_name, $se
             // Update existing setting
             $existing->setting_value = $setting_value;
             $existing->timemodified = $time;
-            $result = $DB->update_record('local_alx_api_settings', $existing);
+            $result = $DB->update_record(\local_alx_report_api\constants::TABLE_SETTINGS, $existing);
             if (!$result) {
                 throw new Exception("Failed to update setting: $setting_name");
             }
@@ -260,7 +305,7 @@ function local_alx_report_api_set_company_setting($companyid, $setting_name, $se
             $setting->setting_value = $setting_value;
             $setting->timecreated = $time;
             $setting->timemodified = $time;
-            $result = $DB->insert_record('local_alx_api_settings', $setting);
+            $result = $DB->insert_record(\local_alx_report_api\constants::TABLE_SETTINGS, $setting);
             if (!$result) {
                 throw new Exception("Failed to insert setting: $setting_name");
             }
@@ -285,12 +330,33 @@ function local_alx_report_api_set_company_setting($companyid, $setting_name, $se
 function local_alx_report_api_get_company_settings($companyid) {
     global $DB;
     
-    $settings = $DB->get_records('local_alx_api_settings', 
-        ['companyid' => $companyid], '', 'setting_name, setting_value');
-    
     $result = [];
-    foreach ($settings as $setting) {
-        $result[$setting->setting_name] = $setting->setting_value;
+    
+    try {
+        // Validate company ID
+        if (empty($companyid) || $companyid <= 0) {
+            error_log('ALX Report API: Invalid company ID provided to get_company_settings');
+            return [];
+        }
+        
+        // Check if settings table exists
+        if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_SETTINGS)) {
+            error_log('ALX Report API: local_alx_api_settings table does not exist');
+            return [];
+        }
+        
+        $settings = $DB->get_records(\local_alx_report_api\constants::TABLE_SETTINGS, 
+            ['companyid' => $companyid], '', 'setting_name, setting_value');
+        
+        if ($settings) {
+            foreach ($settings as $setting) {
+                $result[$setting->setting_name] = $setting->setting_value;
+            }
+        }
+        
+    } catch (Exception $e) {
+        error_log('ALX Report API: Error getting company settings - ' . $e->getMessage());
+        return [];
     }
     
     return $result;
@@ -313,7 +379,7 @@ function local_alx_report_api_copy_company_settings($from_companyid, $to_company
             'field_firstname' => get_config('local_alx_report_api', 'field_firstname') ?: 1,
             'field_lastname' => get_config('local_alx_report_api', 'field_lastname') ?: 1,
             'field_email' => get_config('local_alx_report_api', 'field_email') ?: 1,
-            'field_courseid' => get_config('local_alx_report_api', 'field_courseid') ?: 1,
+            'field_username' => get_config('local_alx_report_api', 'field_username') ?: 1,
             'field_coursename' => get_config('local_alx_report_api', 'field_coursename') ?: 1,
             'field_timecompleted' => get_config('local_alx_report_api', 'field_timecompleted') ?: 1,
             'field_timecompleted_unix' => get_config('local_alx_report_api', 'field_timecompleted_unix') ?: 1,
@@ -354,19 +420,35 @@ function local_alx_report_api_copy_company_settings($from_companyid, $to_company
 function local_alx_report_api_get_company_courses($companyid) {
     global $DB;
     
-    if (!$DB->get_manager()->table_exists('company_course')) {
+    try {
+        // Check if IOMAD company_course table exists
+        if (!$DB->get_manager()->table_exists('company_course')) {
+            error_log('ALX Report API: company_course table does not exist. IOMAD may not be installed.');
+            return [];
+        }
+        
+        // Validate company ID
+        if (empty($companyid) || $companyid <= 0) {
+            error_log('ALX Report API: Invalid company ID provided to get_company_courses');
+            return [];
+        }
+        
+        $sql = "SELECT c.id, c.fullname, c.shortname, c.visible
+                FROM {course} c
+                JOIN {company_course} cc ON cc.courseid = c.id
+                WHERE cc.companyid = :companyid
+                    AND c.visible = 1
+                    AND c.id != 1
+                ORDER BY c.fullname ASC";
+        
+        $courses = $DB->get_records_sql($sql, ['companyid' => $companyid]);
+        
+        return $courses ? $courses : [];
+        
+    } catch (Exception $e) {
+        error_log('ALX Report API: Error getting company courses - ' . $e->getMessage());
         return [];
     }
-    
-    $sql = "SELECT c.id, c.fullname, c.shortname, c.visible
-            FROM {course} c
-            JOIN {company_course} cc ON cc.courseid = c.id
-            WHERE cc.companyid = :companyid
-                AND c.visible = 1
-                AND c.id != 1
-            ORDER BY c.fullname ASC";
-    
-    return $DB->get_records_sql($sql, ['companyid' => $companyid]);
 }
 
 /**
@@ -379,15 +461,35 @@ function local_alx_report_api_get_enabled_courses($companyid) {
     global $DB;
     
     $enabled_courses = [];
-    $company_settings = local_alx_report_api_get_company_settings($companyid);
     
-    foreach ($company_settings as $setting_name => $setting_value) {
-        if (strpos($setting_name, 'course_') === 0 && $setting_value == 1) {
-            $course_id = (int)str_replace('course_', '', $setting_name);
-            if ($course_id > 0) {
-                $enabled_courses[] = $course_id;
+    try {
+        // Validate company ID
+        if (empty($companyid) || $companyid <= 0) {
+            error_log('ALX Report API: Invalid company ID provided to get_enabled_courses');
+            return [];
+        }
+        
+        // Get company settings
+        $company_settings = local_alx_report_api_get_company_settings($companyid);
+        
+        if (empty($company_settings)) {
+            // No settings found - this is normal for new companies
+            return [];
+        }
+        
+        // Extract enabled course IDs from settings
+        foreach ($company_settings as $setting_name => $setting_value) {
+            if (strpos($setting_name, 'course_') === 0 && $setting_value == 1) {
+                $course_id = (int)str_replace('course_', '', $setting_name);
+                if ($course_id > 0) {
+                    $enabled_courses[] = $course_id;
+                }
             }
         }
+        
+    } catch (Exception $e) {
+        error_log('ALX Report API: Error getting enabled courses - ' . $e->getMessage());
+        return [];
     }
     
     return $enabled_courses;
@@ -410,20 +512,22 @@ function local_alx_report_api_is_course_enabled($companyid, $courseid) {
 // ===================================================================
 
 /**
- * Populate the reporting table with initial data from main database.
- * This is run once during setup to create the baseline reporting data.
+ * Populate the reporting table with existing data from the main database.
+ * Enhanced version with better progress reporting.
  *
- * @param int $companyid Specific company ID (0 for all companies)
+ * @param int $companyid Company ID (0 for all companies)
  * @param int $batch_size Number of records to process per batch
- * @return array Status information with counts and timing
+ * @param bool $output_progress Whether to output progress information
+ * @return array Result array with statistics
  */
-function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_size = 1000) {
+function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_size = 1000, $output_progress = false) {
     global $DB;
     
     $start_time = time();
     $total_processed = 0;
     $total_inserted = 0;
     $errors = [];
+    $companies_processed = 0;
     
     try {
         // Get companies to process
@@ -433,8 +537,22 @@ function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_si
             $companies = $DB->get_records('company', null, 'id ASC');
         }
         
+        $total_companies = count($companies);
+        $current_company = 0;
+        
         foreach ($companies as $company) {
             if (!$company) continue;
+            
+            $current_company++;
+            $companies_processed++;
+            
+            if ($output_progress && !defined('CLI_SCRIPT')) {
+                $is_cli = (php_sapi_name() === 'cli');
+                if (!$is_cli) {
+                    echo '<script>addLogEntry("🏢 Processing company: ' . htmlspecialchars($company->name) . ' (' . $current_company . '/' . $total_companies . ')...", "company");</script>';
+                    flush();
+                }
+            }
             
             // Get enabled courses for this company
             $enabled_courses = local_alx_report_api_get_enabled_courses($company->id);
@@ -445,8 +563,22 @@ function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_si
             }
             
             if (empty($enabled_courses)) {
+                if ($output_progress && !defined('CLI_SCRIPT')) {
+                    $is_cli = (php_sapi_name() === 'cli');
+                    if (!$is_cli) {
+                        echo '<script>addLogEntry("  ⚠️ No courses found for ' . htmlspecialchars($company->name) . ' - skipping", "warning");</script>';
+                        flush();
+                    }
+                }
                 continue; // Skip if no courses available
             }
+            
+            $company_processed = 0;
+            $company_inserted = 0;
+            
+            // DEBUG: Log company and enabled courses
+            error_log("DEBUG populate_reporting_table: Processing company {$company->id} ({$company->name})");
+            error_log("DEBUG populate_reporting_table: Enabled courses: " . implode(', ', $enabled_courses));
             
             // Build the complex query to get all user-course data
             list($course_sql, $course_params) = $DB->get_in_or_equal($enabled_courses, SQL_PARAMS_NAMED, 'course');
@@ -457,6 +589,7 @@ function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_si
                     u.firstname,
                     u.lastname,
                     u.email,
+                    u.username,
                     c.id as courseid,
                     c.fullname as coursename,
                     COALESCE(cc.timecompleted, 
@@ -505,20 +638,29 @@ function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_si
             
             $params = array_merge(['companyid' => $company->id], $course_params);
             
+            // DEBUG: Log SQL query
+            error_log("DEBUG populate_reporting_table: SQL query params - " . print_r($params, true));
+            
             // Process in batches
             $offset = 0;
+            $batch_count = 0;
             while (true) {
                 $records = $DB->get_records_sql($sql, $params, $offset, $batch_size);
+                $batch_count++;
+                error_log("DEBUG populate_reporting_table: Batch $batch_count - Fetched " . count($records) . " records at offset $offset");
+                
                 if (empty($records)) {
+                    error_log("DEBUG populate_reporting_table: No more records, breaking loop");
                     break;
                 }
                 
                 $batch_inserted = 0;
+                $batch_updated = 0;
                 $current_time = time();
                 
                 foreach ($records as $record) {
                     // Check if record already exists
-                    $existing = $DB->get_record('local_alx_api_reporting', [
+                    $existing = $DB->get_record(\local_alx_report_api\constants::TABLE_REPORTING, [
                         'userid' => $record->userid,
                         'courseid' => $record->courseid,
                         'companyid' => $company->id
@@ -526,6 +668,7 @@ function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_si
                     
                     if (!$existing) {
                         // Insert new record
+                        error_log("DEBUG populate_reporting_table: INSERTING new record - User {$record->userid}, Course {$record->courseid}");
                         $reporting_record = new stdClass();
                         $reporting_record->userid = $record->userid;
                         $reporting_record->companyid = $company->id;
@@ -533,6 +676,7 @@ function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_si
                         $reporting_record->firstname = $record->firstname;
                         $reporting_record->lastname = $record->lastname;
                         $reporting_record->email = $record->email;
+                        $reporting_record->username = $record->username;
                         $reporting_record->coursename = $record->coursename;
                         $reporting_record->timecompleted = $record->timecompleted;
                         $reporting_record->timestarted = $record->timestarted;
@@ -540,16 +684,35 @@ function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_si
                         $reporting_record->status = $record->status;
                         $reporting_record->last_updated = $current_time;
                         $reporting_record->is_deleted = 0;
-                        $reporting_record->created_at = $current_time;
-                        $reporting_record->updated_at = $current_time;
+                        $reporting_record->timecreated = $current_time;
+                        $reporting_record->timemodified = $current_time;
                         
-                        $DB->insert_record('local_alx_api_reporting', $reporting_record);
+                        $DB->insert_record(\local_alx_report_api\constants::TABLE_REPORTING, $reporting_record);
                         $batch_inserted++;
+                        $company_inserted++;
+                    } else {
+                        // Update existing record
+                        error_log("DEBUG populate_reporting_table: UPDATING existing record - User {$record->userid}, Course {$record->courseid}");
+                        $existing->firstname = $record->firstname;
+                        $existing->lastname = $record->lastname;
+                        $existing->email = $record->email;
+                        $existing->username = $record->username;
+                        $existing->coursename = $record->coursename;
+                        $existing->timecompleted = $record->timecompleted;
+                        $existing->timestarted = $record->timestarted;
+                        $existing->percentage = $record->percentage;
+                        $existing->status = $record->status;
+                        $existing->last_updated = $current_time;
+                        $existing->timemodified = $current_time;
+                        
+                        $DB->update_record(\local_alx_report_api\constants::TABLE_REPORTING, $existing);
+                        $batch_updated++;
                     }
                 }
                 
-                $total_processed += count($records);
-                $total_inserted += $batch_inserted;
+                error_log("DEBUG populate_reporting_table: Batch complete - Inserted: $batch_inserted, Updated: $batch_updated");
+                
+                $company_processed += count($records);
                 $offset += $batch_size;
                 
                 // Break if we got fewer records than batch size (end of data)
@@ -557,14 +720,35 @@ function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_si
                     break;
                 }
             }
+            
+            $total_processed += $company_processed;
+            $total_inserted += $company_inserted;
+            
+            error_log("DEBUG populate_reporting_table: Company {$company->id} complete - Processed: $company_processed, Inserted: $company_inserted");
+            error_log("DEBUG populate_reporting_table: Running totals - Total Processed: $total_processed, Total Inserted: $total_inserted");
+            
+            if ($output_progress && !defined('CLI_SCRIPT')) {
+                $is_cli = (php_sapi_name() === 'cli');
+                if (!$is_cli) {
+                    echo '<script>addLogEntry("  ✅ ' . htmlspecialchars($company->name) . ' - Processed: ' . number_format($company_processed) . ', Inserted: ' . number_format($company_inserted) . '", "success");</script>';
+                    // Update progress
+                    $percentage = round(($current_company / $total_companies) * 100);
+                    echo '<script>updateProgress(' . $total_processed . ', ' . $total_inserted . ', ' . $companies_processed . ', ' . $percentage . ');</script>';
+                    flush();
+                }
+            }
         }
         
     } catch (Exception $e) {
+        error_log("DEBUG populate_reporting_table: EXCEPTION caught - " . $e->getMessage());
+        error_log("DEBUG populate_reporting_table: Exception trace - " . $e->getTraceAsString());
         $errors[] = 'Population error: ' . $e->getMessage();
     }
     
     $end_time = time();
     $duration = $end_time - $start_time;
+    
+    error_log("DEBUG populate_reporting_table: FINAL RETURN - Total Processed: $total_processed, Total Inserted: $total_inserted, Duration: {$duration}s, Errors: " . count($errors));
     
     return [
         'success' => empty($errors),
@@ -572,17 +756,18 @@ function local_alx_report_api_populate_reporting_table($companyid = 0, $batch_si
         'total_inserted' => $total_inserted,
         'duration_seconds' => $duration,
         'errors' => $errors,
-        'companies_processed' => count($companies ?? [])
+        'companies_processed' => $companies_processed
     ];
 }
 
 /**
  * Update a single record in the reporting table.
+ * Fetches fresh data from Moodle database and updates/creates reporting table record.
  *
  * @param int $userid User ID
  * @param int $companyid Company ID
  * @param int $courseid Course ID
- * @return bool True on success
+ * @return array Array with 'created' and 'updated' boolean flags
  */
 function local_alx_report_api_update_reporting_record($userid, $companyid, $courseid) {
     global $DB;
@@ -595,6 +780,7 @@ function local_alx_report_api_update_reporting_record($userid, $companyid, $cour
                 u.firstname,
                 u.lastname,
                 u.email,
+                u.username,
                 c.id as courseid,
                 c.fullname as coursename,
                 COALESCE(cc.timecompleted, 
@@ -650,11 +836,12 @@ function local_alx_report_api_update_reporting_record($userid, $companyid, $cour
         
         if (!$record) {
             // User not found or not enrolled, mark as deleted
-            return local_alx_report_api_soft_delete_reporting_record($userid, $companyid, $courseid);
+            local_alx_report_api_soft_delete_reporting_record($userid, $companyid, $courseid);
+            return ['created' => false, 'updated' => false, 'deleted' => true];
         }
         
         // Check if reporting record exists
-        $existing = $DB->get_record('local_alx_api_reporting', [
+        $existing = $DB->get_record(\local_alx_report_api\constants::TABLE_REPORTING, [
             'userid' => $userid,
             'courseid' => $courseid,
             'companyid' => $companyid
@@ -663,10 +850,11 @@ function local_alx_report_api_update_reporting_record($userid, $companyid, $cour
         $current_time = time();
         
         if ($existing) {
-            // Update existing record
+            // Update existing record with fresh data
             $existing->firstname = $record->firstname;
             $existing->lastname = $record->lastname;
             $existing->email = $record->email;
+            $existing->username = $record->username;
             $existing->coursename = $record->coursename;
             $existing->timecompleted = $record->timecompleted;
             $existing->timestarted = $record->timestarted;
@@ -674,9 +862,10 @@ function local_alx_report_api_update_reporting_record($userid, $companyid, $cour
             $existing->status = $record->status;
             $existing->last_updated = $current_time;
             $existing->is_deleted = 0;
-            $existing->updated_at = $current_time;
+            $existing->timemodified = $current_time;
             
-            return $DB->update_record('local_alx_api_reporting', $existing);
+            $success = $DB->update_record(\local_alx_report_api\constants::TABLE_REPORTING, $existing);
+            return ['created' => false, 'updated' => $success];
         } else {
             // Insert new record
             $reporting_record = new stdClass();
@@ -686,6 +875,7 @@ function local_alx_report_api_update_reporting_record($userid, $companyid, $cour
             $reporting_record->firstname = $record->firstname;
             $reporting_record->lastname = $record->lastname;
             $reporting_record->email = $record->email;
+            $reporting_record->username = $record->username;
             $reporting_record->coursename = $record->coursename;
             $reporting_record->timecompleted = $record->timecompleted;
             $reporting_record->timestarted = $record->timestarted;
@@ -693,15 +883,16 @@ function local_alx_report_api_update_reporting_record($userid, $companyid, $cour
             $reporting_record->status = $record->status;
             $reporting_record->last_updated = $current_time;
             $reporting_record->is_deleted = 0;
-            $reporting_record->created_at = $current_time;
-            $reporting_record->updated_at = $current_time;
+            $reporting_record->timecreated = $current_time;
+            $reporting_record->timemodified = $current_time;
             
-            return $DB->insert_record('local_alx_api_reporting', $reporting_record);
+            $success = $DB->insert_record(\local_alx_report_api\constants::TABLE_REPORTING, $reporting_record);
+            return ['created' => (bool)$success, 'updated' => false];
         }
         
     } catch (Exception $e) {
         debugging('Error updating reporting record: ' . $e->getMessage(), DEBUG_DEVELOPER);
-        return false;
+        return ['created' => false, 'updated' => false, 'error' => $e->getMessage()];
     }
 }
 
@@ -716,7 +907,7 @@ function local_alx_report_api_update_reporting_record($userid, $companyid, $cour
 function local_alx_report_api_soft_delete_reporting_record($userid, $companyid, $courseid) {
     global $DB;
     
-    $existing = $DB->get_record('local_alx_api_reporting', [
+    $existing = $DB->get_record(\local_alx_report_api\constants::TABLE_REPORTING, [
         'userid' => $userid,
         'courseid' => $courseid,
         'companyid' => $companyid
@@ -725,8 +916,8 @@ function local_alx_report_api_soft_delete_reporting_record($userid, $companyid, 
     if ($existing) {
         $existing->is_deleted = 1;
         $existing->last_updated = time();
-        $existing->updated_at = time();
-        return $DB->update_record('local_alx_api_reporting', $existing);
+        $existing->timemodified = time();
+        return $DB->update_record(\local_alx_report_api\constants::TABLE_REPORTING, $existing);
     }
     
     return true; // Already doesn't exist
@@ -757,6 +948,288 @@ function local_alx_report_api_sync_user_data($userid, $companyid) {
 }
 
 /**
+ * Sync only recent changes to the reporting table (incremental sync).
+ * This is much faster than full population as it only processes changed records.
+ *
+ * @param int $companyid Company ID (0 for all companies)
+ * @param int $hours_back Number of hours to look back for changes
+ * @return array Statistics about the sync operation
+ */
+function local_alx_report_api_sync_recent_changes($companyid = 0, $hours_back = 1) {
+    global $DB;
+    
+    $start_time = time();
+    $cutoff_time = $start_time - ($hours_back * 3600);
+    
+    $stats = [
+        'success' => true,
+        'total_processed' => 0,
+        'records_created' => 0,
+        'records_updated' => 0,
+        'records_deleted' => 0,
+        'companies_processed' => 0,
+        'errors' => []
+    ];
+    
+    try {
+        // Get companies to process
+        if ($companyid > 0) {
+            $companies = [$DB->get_record('company', ['id' => $companyid])];
+        } else {
+            $companies = $DB->get_records('company', null, 'id ASC');
+        }
+        
+        foreach ($companies as $company) {
+            if (!$company) continue;
+            
+            $stats['companies_processed']++;
+            $company_changes = [];
+            
+            // 1. Find users with recent course completion changes
+            try {
+                $completion_sql = "
+                    SELECT DISTINCT cc.userid, cc.course as courseid
+                    FROM {course_completions} cc
+                    JOIN {company_users} cu ON cu.userid = cc.userid
+                    WHERE cc.timecompleted >= :cutoff_time 
+                    AND cu.companyid = :companyid
+                    AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM {local_alx_api_reporting} r
+                            WHERE r.userid = cc.userid 
+                            AND r.courseid = cc.course
+                            AND r.companyid = cu.companyid
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM {local_alx_api_reporting} r
+                            WHERE r.userid = cc.userid 
+                            AND r.courseid = cc.course
+                            AND r.companyid = cu.companyid
+                            AND cc.timecompleted > r.last_updated
+                        )
+                    )";
+                
+                $completion_changes = $DB->get_records_sql($completion_sql, [
+                    'cutoff_time' => $cutoff_time,
+                    'companyid' => $company->id
+                ]);
+                
+                $company_changes = array_merge($company_changes, $completion_changes);
+            } catch (Exception $e) {
+                $stats['errors'][] = "Company {$company->id} completion query error: " . $e->getMessage();
+            }
+            
+            // 2. Find users with recent module completion changes
+            try {
+                $module_sql = "
+                    SELECT DISTINCT cmc.userid, cm.course as courseid
+                    FROM {course_modules_completion} cmc
+                    JOIN {course_modules} cm ON cm.id = cmc.coursemoduleid
+                    JOIN {company_users} cu ON cu.userid = cmc.userid
+                    WHERE cmc.timemodified >= :cutoff_time 
+                    AND cu.companyid = :companyid
+                    AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM {local_alx_api_reporting} r
+                            WHERE r.userid = cmc.userid 
+                            AND r.courseid = cm.course
+                            AND r.companyid = cu.companyid
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM {local_alx_api_reporting} r
+                            WHERE r.userid = cmc.userid 
+                            AND r.courseid = cm.course
+                            AND r.companyid = cu.companyid
+                            AND cmc.timemodified > r.last_updated
+                        )
+                    )";
+                
+                $module_changes = $DB->get_records_sql($module_sql, [
+                    'cutoff_time' => $cutoff_time,
+                    'companyid' => $company->id
+                ]);
+                
+                $company_changes = array_merge($company_changes, $module_changes);
+            } catch (Exception $e) {
+                $stats['errors'][] = "Company {$company->id} module query error: " . $e->getMessage();
+            }
+            
+            // 3. Find users with recent enrollment changes
+            try {
+                $enrollment_sql = "
+                    SELECT DISTINCT ue.userid, e.courseid
+                    FROM {user_enrolments} ue
+                    JOIN {enrol} e ON e.id = ue.enrolid
+                    JOIN {company_users} cu ON cu.userid = ue.userid
+                    WHERE ue.timemodified >= :cutoff_time 
+                    AND cu.companyid = :companyid
+                    AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM {local_alx_api_reporting} r
+                            WHERE r.userid = ue.userid 
+                            AND r.courseid = e.courseid
+                            AND r.companyid = cu.companyid
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM {local_alx_api_reporting} r
+                            WHERE r.userid = ue.userid 
+                            AND r.courseid = e.courseid
+                            AND r.companyid = cu.companyid
+                            AND ue.timemodified > r.last_updated
+                        )
+                    )";
+                
+                $enrollment_changes = $DB->get_records_sql($enrollment_sql, [
+                    'cutoff_time' => $cutoff_time,
+                    'companyid' => $company->id
+                ]);
+                
+                $company_changes = array_merge($company_changes, $enrollment_changes);
+            } catch (Exception $e) {
+                $stats['errors'][] = "Company {$company->id} enrollment query error: " . $e->getMessage();
+            }
+            
+            // 4. Find users with recent profile changes (firstname, lastname, email, username)
+            try {
+                $user_profile_sql = "
+                    SELECT DISTINCT u.id as userid, r.courseid
+                    FROM {user} u
+                    JOIN {company_users} cu ON cu.userid = u.id
+                    JOIN {local_alx_api_reporting} r ON r.userid = u.id AND r.companyid = cu.companyid
+                    WHERE u.timemodified >= :cutoff_time
+                    AND cu.companyid = :companyid
+                    AND u.deleted = 0
+                    AND u.suspended = 0
+                    AND u.timemodified > r.last_updated";
+                
+                $user_profile_changes = $DB->get_records_sql($user_profile_sql, [
+                    'cutoff_time' => $cutoff_time,
+                    'companyid' => $company->id
+                ]);
+                
+                $company_changes = array_merge($company_changes, $user_profile_changes);
+            } catch (Exception $e) {
+                $stats['errors'][] = "Company {$company->id} user profile query error: " . $e->getMessage();
+            }
+            
+            // Remove duplicates (same user-course combination)
+            $unique_changes = [];
+            foreach ($company_changes as $change) {
+                $key = "{$change->userid}-{$change->courseid}";
+                if (!isset($unique_changes[$key])) {
+                    $unique_changes[$key] = $change;
+                }
+            }
+            
+            // Update each changed record
+            foreach ($unique_changes as $change) {
+                try {
+                    $result = local_alx_report_api_update_reporting_record(
+                        $change->userid,
+                        $company->id,
+                        $change->courseid
+                    );
+                    
+                    if ($result['created'] || $result['updated']) {
+                        $stats['total_processed']++;
+                        if ($result['created']) {
+                            $stats['records_created']++;
+                        } else if ($result['updated']) {
+                            $stats['records_updated']++;
+                        }
+                    } else if (isset($result['deleted']) && $result['deleted']) {
+                        $stats['total_processed']++;
+                        $stats['records_deleted']++;
+                    }
+                } catch (Exception $e) {
+                    $stats['errors'][] = "Error updating user {$change->userid}, course {$change->courseid}: " . $e->getMessage();
+                }
+            }
+            
+            // 5. Detect and mark deleted/suspended users and unenrolled courses
+            try {
+                $deletion_sql = "
+                    SELECT DISTINCT r.userid, r.courseid
+                    FROM {local_alx_api_reporting} r
+                    WHERE r.companyid = :companyid
+                    AND r.is_deleted = 0
+                    AND (
+                        -- User is deleted or suspended
+                        EXISTS (
+                            SELECT 1 FROM {user} u
+                            WHERE u.id = r.userid
+                            AND (u.deleted = 1 OR u.suspended = 1)
+                        )
+                        -- OR user no longer in company
+                        OR NOT EXISTS (
+                            SELECT 1 FROM {company_users} cu
+                            WHERE cu.userid = r.userid
+                            AND cu.companyid = :companyid2
+                        )
+                        -- OR user no longer enrolled in course
+                        OR NOT EXISTS (
+                            SELECT 1 FROM {user_enrolments} ue
+                            JOIN {enrol} e ON e.id = ue.enrolid
+                            WHERE ue.userid = r.userid
+                            AND e.courseid = r.courseid
+                        )
+                        -- OR course is hidden
+                        OR EXISTS (
+                            SELECT 1 FROM {course} c
+                            WHERE c.id = r.courseid
+                            AND c.visible = 0
+                        )
+                    )";
+                
+                $records_to_delete = $DB->get_records_sql($deletion_sql, [
+                    'companyid' => $company->id,
+                    'companyid2' => $company->id
+                ]);
+                
+                foreach ($records_to_delete as $record) {
+                    try {
+                        if (local_alx_report_api_soft_delete_reporting_record($record->userid, $company->id, $record->courseid)) {
+                            $stats['total_processed']++;
+                            $stats['records_deleted']++;
+                        }
+                    } catch (Exception $e) {
+                        $stats['errors'][] = "Error deleting user {$record->userid}, course {$record->courseid}: " . $e->getMessage();
+                    }
+                }
+            } catch (Exception $e) {
+                $stats['errors'][] = "Company {$company->id} deletion detection error: " . $e->getMessage();
+            }
+        }
+        
+        $stats['duration_seconds'] = time() - $start_time;
+        
+        if (!empty($stats['errors'])) {
+            $stats['success'] = false;
+        }
+        
+        // Clear cache ONLY if caching is enabled for this company
+        if ($stats['total_processed'] > 0) {
+            // Check if caching is enabled (default: enabled for backward compatibility)
+            $cache_enabled = local_alx_report_api_get_company_setting($company->id, 'enable_cache', 1);
+            
+            if ($cache_enabled) {
+                $cache_cleared = local_alx_report_api_cache_clear_company($company->id);
+                $stats['cache_cleared'] = $cache_cleared;
+            } else {
+                $stats['cache_cleared'] = 0;
+                $stats['cache_status'] = 'disabled';
+            }
+        }
+        
+    } catch (Exception $e) {
+        $stats['success'] = false;
+        $stats['errors'][] = 'Critical sync error: ' . $e->getMessage();
+    }
+    
+    return $stats;
+}
+
+/**
  * Get sync status for a company and token combination.
  *
  * @param int $companyid Company ID
@@ -768,7 +1241,7 @@ function local_alx_report_api_get_sync_status($companyid, $token) {
     
     $token_hash = hash('sha256', $token);
     
-    return $DB->get_record('local_alx_api_sync_status', [
+    return $DB->get_record(\local_alx_report_api\constants::TABLE_SYNC_STATUS, [
         'companyid' => $companyid,
         'token_hash' => $token_hash
     ]);
@@ -790,7 +1263,7 @@ function local_alx_report_api_update_sync_status($companyid, $token, $records_co
     $token_hash = hash('sha256', $token);
     $current_time = time();
     
-    $existing = $DB->get_record('local_alx_api_sync_status', [
+    $existing = $DB->get_record(\local_alx_report_api\constants::TABLE_SYNC_STATUS, [
         'companyid' => $companyid,
         'token_hash' => $token_hash
     ]);
@@ -802,9 +1275,9 @@ function local_alx_report_api_update_sync_status($companyid, $token, $records_co
         $existing->last_sync_status = $status;
         $existing->last_sync_error = $error_message;
         $existing->total_syncs = $existing->total_syncs + 1;
-        $existing->updated_at = $current_time;
+        $existing->timemodified = $current_time;
         
-        return $DB->update_record('local_alx_api_sync_status', $existing);
+        return $DB->update_record(\local_alx_report_api\constants::TABLE_SYNC_STATUS, $existing);
     } else {
         // Create new record
         $sync_status = new stdClass();
@@ -817,10 +1290,10 @@ function local_alx_report_api_update_sync_status($companyid, $token, $records_co
         $sync_status->last_sync_status = $status;
         $sync_status->last_sync_error = $error_message;
         $sync_status->total_syncs = 1;
-        $sync_status->created_at = $current_time;
-        $sync_status->updated_at = $current_time;
+        $sync_status->timecreated = $current_time;
+        $sync_status->timemodified = $current_time;
         
-        return $DB->insert_record('local_alx_api_sync_status', $sync_status);
+        return $DB->insert_record(\local_alx_report_api\constants::TABLE_SYNC_STATUS, $sync_status);
     }
 }
 
@@ -882,28 +1355,45 @@ function local_alx_report_api_determine_sync_mode($companyid, $token) {
 function local_alx_report_api_cache_get($cache_key, $companyid) {
     global $DB;
     
-    $cache_record = $DB->get_record('local_alx_api_cache', [
-        'cache_key' => $cache_key,
-        'companyid' => $companyid
-    ]);
-    
-    if (!$cache_record) {
+    try {
+        // Check if cache table exists
+        if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_CACHE)) {
+            error_log('ALX Report API: local_alx_api_cache table does not exist');
+            return false;
+        }
+        
+        // Validate inputs
+        if (empty($cache_key) || empty($companyid)) {
+            return false;
+        }
+        
+        $cache_record = $DB->get_record(\local_alx_report_api\constants::TABLE_CACHE, [
+            'cache_key' => $cache_key,
+            'companyid' => $companyid
+        ]);
+        
+        if (!$cache_record) {
+            return false;
+        }
+        
+        // Check if expired
+        if ($cache_record->expires_at < time()) {
+            // Delete expired cache
+            $DB->delete_records(\local_alx_report_api\constants::TABLE_CACHE, ['id' => $cache_record->id]);
+            return false;
+        }
+        
+        // Update hit count and last accessed
+        $cache_record->hit_count++;
+        $cache_record->timeaccessed = time();
+        $DB->update_record(\local_alx_report_api\constants::TABLE_CACHE, $cache_record);
+        
+        return json_decode($cache_record->cache_data, true);
+        
+    } catch (Exception $e) {
+        error_log('ALX Report API: Error getting cache - ' . $e->getMessage());
         return false;
     }
-    
-    // Check if expired
-    if ($cache_record->expires_at < time()) {
-        // Delete expired cache
-        $DB->delete_records('local_alx_api_cache', ['id' => $cache_record->id]);
-        return false;
-    }
-    
-    // Update hit count and last accessed
-    $cache_record->hit_count++;
-    $cache_record->last_accessed = time();
-    $DB->update_record('local_alx_api_cache', $cache_record);
-    
-    return json_decode($cache_record->cache_data, true);
 }
 
 /**
@@ -921,7 +1411,7 @@ function local_alx_report_api_cache_set($cache_key, $companyid, $data, $ttl = 36
     $current_time = time();
     $expires_at = $current_time + $ttl;
     
-    $existing = $DB->get_record('local_alx_api_cache', [
+    $existing = $DB->get_record(\local_alx_report_api\constants::TABLE_CACHE, [
         'cache_key' => $cache_key,
         'companyid' => $companyid
     ]);
@@ -929,23 +1419,23 @@ function local_alx_report_api_cache_set($cache_key, $companyid, $data, $ttl = 36
     if ($existing) {
         // Update existing cache
         $existing->cache_data = json_encode($data);
-        $existing->cache_timestamp = $current_time;
+        $existing->timecreated = $current_time;
         $existing->expires_at = $expires_at;
-        $existing->last_accessed = $current_time;
+        $existing->timeaccessed = $current_time;
         
-        return $DB->update_record('local_alx_api_cache', $existing);
+        return $DB->update_record(\local_alx_report_api\constants::TABLE_CACHE, $existing);
     } else {
         // Create new cache entry
         $cache_record = new stdClass();
         $cache_record->cache_key = $cache_key;
         $cache_record->companyid = $companyid;
         $cache_record->cache_data = json_encode($data);
-        $cache_record->cache_timestamp = $current_time;
+        $cache_record->timecreated = $current_time;
         $cache_record->expires_at = $expires_at;
         $cache_record->hit_count = 0;
-        $cache_record->last_accessed = $current_time;
+        $cache_record->timeaccessed = $current_time;
         
-        return $DB->insert_record('local_alx_api_cache', $cache_record);
+        return $DB->insert_record(\local_alx_report_api\constants::TABLE_CACHE, $cache_record);
     }
 }
 
@@ -960,7 +1450,37 @@ function local_alx_report_api_cache_cleanup($max_age_hours = 24) {
     
     $cutoff_time = time() - ($max_age_hours * 3600);
     
-    return $DB->delete_records_select('local_alx_api_cache', 'expires_at < ?', [$cutoff_time]);
+    return $DB->delete_records_select(\local_alx_report_api\constants::TABLE_CACHE, 'expires_at < ?', [$cutoff_time]);
+}
+
+/**
+ * Clear all cache entries for a specific company.
+ * Used after manual sync or data updates to ensure API returns fresh data.
+ *
+ * @param int $companyid Company ID
+ * @return int Number of cache entries cleared
+ */
+function local_alx_report_api_cache_clear_company($companyid) {
+    global $DB;
+    
+    try {
+        // Check if cache table exists
+        if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_CACHE)) {
+            return 0;
+        }
+        
+        // Validate company ID
+        if (empty($companyid) || $companyid <= 0) {
+            return 0;
+        }
+        
+        // Delete all cache entries for this company
+        return $DB->delete_records(\local_alx_report_api\constants::TABLE_CACHE, ['companyid' => $companyid]);
+        
+    } catch (Exception $e) {
+        error_log('ALX Report API: Error clearing company cache - ' . $e->getMessage());
+        return 0;
+    }
 }
 
 /**
@@ -983,26 +1503,26 @@ function local_alx_report_api_get_reporting_stats($companyid = 0) {
     }
     
     // Total records
-    $stats['total_records'] = $DB->count_records_select('local_alx_api_reporting', $where, $params);
+    $stats['total_records'] = $DB->count_records_select(\local_alx_report_api\constants::TABLE_REPORTING, $where, $params);
     
     // Active records (not deleted)
-    $stats['active_records'] = $DB->count_records_select('local_alx_api_reporting', 
+    $stats['active_records'] = $DB->count_records_select(\local_alx_report_api\constants::TABLE_REPORTING, 
         $where . ' AND is_deleted = 0', $params);
     
     // Deleted records
-    $stats['deleted_records'] = $DB->count_records_select('local_alx_api_reporting', 
+    $stats['deleted_records'] = $DB->count_records_select(\local_alx_report_api\constants::TABLE_REPORTING, 
         $where . ' AND is_deleted = 1', $params);
     
     // Completed courses
-    $stats['completed_courses'] = $DB->count_records_select('local_alx_api_reporting', 
+    $stats['completed_courses'] = $DB->count_records_select(\local_alx_report_api\constants::TABLE_REPORTING, 
         $where . ' AND status = ? AND is_deleted = 0', array_merge($params, ['completed']));
     
     // In progress courses
-    $stats['in_progress_courses'] = $DB->count_records_select('local_alx_api_reporting', 
+    $stats['in_progress_courses'] = $DB->count_records_select(\local_alx_report_api\constants::TABLE_REPORTING, 
         $where . ' AND status = ? AND is_deleted = 0', array_merge($params, ['in_progress']));
     
     // Last update time
-    $last_update = $DB->get_field_select('local_alx_api_reporting', 'MAX(last_updated)', $where, $params);
+    $last_update = $DB->get_field_select(\local_alx_report_api\constants::TABLE_REPORTING, 'MAX(last_updated)', $where, $params);
     $stats['last_update'] = $last_update ?: 0;
     
     return $stats;
@@ -1030,55 +1550,66 @@ function local_alx_report_api_get_system_stats() {
     ];
     
     // Total records in reporting table
-    if ($DB->get_manager()->table_exists('local_alx_api_reporting')) {
-        $stats['total_records'] = $DB->count_records('local_alx_api_reporting');
+    if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_REPORTING)) {
+        $stats['total_records'] = $DB->count_records(\local_alx_report_api\constants::TABLE_REPORTING);
     }
     
     // Total companies
     $stats['total_companies'] = count(local_alx_report_api_get_companies());
     
     // API calls statistics
-    if ($DB->get_manager()->table_exists('local_alx_api_logs')) {
+    if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_LOGS)) {
         $today_start = mktime(0, 0, 0);
         $week_start = strtotime('-7 days', $today_start);
         
+        // Use standard Moodle field name
+        $time_field = 'timecreated';
+        
         $stats['api_calls_today'] = $DB->count_records_select(
-            'local_alx_api_logs',
-            'timecreated >= ?',
+            \local_alx_report_api\constants::TABLE_LOGS,
+            "{$time_field} >= ?",
             [$today_start]
         );
         
         $stats['api_calls_week'] = $DB->count_records_select(
-            'local_alx_api_logs',
-            'timecreated >= ?',
+            \local_alx_report_api\constants::TABLE_LOGS,
+            "{$time_field} >= ?",
             [$week_start]
         );
         
         // Last sync time
         $last_sync = $DB->get_field_select(
-            'local_alx_api_logs',
-            'MAX(timecreated)',
+            \local_alx_report_api\constants::TABLE_LOGS,
+            "MAX({$time_field})",
             'action LIKE ?',
             ['%sync%']
         );
         $stats['last_sync'] = $last_sync ?: 0;
     }
     
-    // Active tokens count
+    // Active tokens count - check both service names
     if ($DB->get_manager()->table_exists('external_tokens')) {
-        $service_id = $DB->get_field('external_services', 'id', ['shortname' => 'alx_report_api']);
+        // Check for primary service name first
+        $service_id = $DB->get_field('external_services', 'id', ['shortname' => 'alx_report_api_custom']);
+        if (!$service_id) {
+            // Fallback to legacy service name
+            $service_id = $DB->get_field('external_services', 'id', ['shortname' => 'alx_report_api']);
+        }
+        
         if ($service_id) {
             $stats['active_tokens'] = $DB->count_records('external_tokens', [
                 'externalserviceid' => $service_id,
                 'tokentype' => EXTERNAL_TOKEN_PERMANENT
             ]);
+        } else {
+            $stats['active_tokens'] = 0;
         }
     }
     
     // Cache hit rate
-    if ($DB->get_manager()->table_exists('local_alx_api_cache')) {
-        $total_cache_requests = $DB->count_records('local_alx_api_cache');
-        $cache_hits = $DB->count_records_select('local_alx_api_cache', 'hits > 0');
+    if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_CACHE)) {
+        $total_cache_requests = $DB->count_records(\local_alx_report_api\constants::TABLE_CACHE);
+        $cache_hits = $DB->count_records_select(\local_alx_report_api\constants::TABLE_CACHE, 'hits > 0');
         if ($total_cache_requests > 0) {
             $stats['cache_hit_rate'] = round(($cache_hits / $total_cache_requests) * 100, 1);
         }
@@ -1118,35 +1649,62 @@ function local_alx_report_api_get_company_stats($companyid = 0) {
         ];
         
         // Records count
-        if ($DB->get_manager()->table_exists('local_alx_api_reporting')) {
-            $stats['total_records'] = $DB->count_records('local_alx_api_reporting', [
+        if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_REPORTING)) {
+            $stats['total_records'] = $DB->count_records(\local_alx_report_api\constants::TABLE_REPORTING, [
                 'companyid' => $company->id
             ]);
         }
         
         // API usage
-        if ($DB->get_manager()->table_exists('local_alx_api_logs')) {
+        if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_LOGS)) {
             $today_start = mktime(0, 0, 0);
             $week_start = strtotime('-7 days', $today_start);
             
-            $stats['api_calls_today'] = $DB->count_records_select(
-                'local_alx_api_logs',
-                'companyid = ? AND timecreated >= ?',
-                [$company->id, $today_start]
-            );
+            // Use standard Moodle field name
+            $time_field = 'timecreated';
             
-            $stats['api_calls_week'] = $DB->count_records_select(
-                'local_alx_api_logs',
-                'companyid = ? AND timecreated >= ?',
-                [$company->id, $week_start]
-            );
-            
-            $last_access = $DB->get_field_select(
-                'local_alx_api_logs',
-                'MAX(timecreated)',
-                'companyid = ?',
-                [$company->id]
-            );
+            // Determine which company field to use
+            if (isset($table_info['companyid'])) {
+                // Old schema
+                $stats['api_calls_today'] = $DB->count_records_select(
+                    \local_alx_report_api\constants::TABLE_LOGS,
+                    "companyid = ? AND {$time_field} >= ?",
+                    [$company->id, $today_start]
+                );
+                
+                $stats['api_calls_week'] = $DB->count_records_select(
+                    \local_alx_report_api\constants::TABLE_LOGS,
+                    "companyid = ? AND {$time_field} >= ?",
+                    [$company->id, $week_start]
+                );
+                
+                $last_access = $DB->get_field_select(
+                    \local_alx_report_api\constants::TABLE_LOGS,
+                    "MAX({$time_field})",
+                    'companyid = ?',
+                    [$company->id]
+                );
+            } else if (isset($table_info['company_shortname'])) {
+                // New schema
+                $stats['api_calls_today'] = $DB->count_records_select(
+                    \local_alx_report_api\constants::TABLE_LOGS,
+                    "company_shortname = ? AND {$time_field} >= ?",
+                    [$company->shortname, $today_start]
+                );
+                
+                $stats['api_calls_week'] = $DB->count_records_select(
+                    \local_alx_report_api\constants::TABLE_LOGS,
+                    "company_shortname = ? AND {$time_field} >= ?",
+                    [$company->shortname, $week_start]
+                );
+                
+                $last_access = $DB->get_field_select(
+                    \local_alx_report_api\constants::TABLE_LOGS,
+                    "MAX({$time_field})",
+                    'company_shortname = ?',
+                    [$company->shortname]
+                );
+            }
             $stats['last_access'] = $last_access ?: 0;
         }
         
@@ -1154,9 +1712,9 @@ function local_alx_report_api_get_company_stats($companyid = 0) {
         $stats['enabled_courses'] = count(local_alx_report_api_get_enabled_courses($company->id));
         
         // Sync status
-        if ($DB->get_manager()->table_exists('local_alx_api_sync_status')) {
+        if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_SYNC_STATUS)) {
             $sync_record = $DB->get_record_select(
-                'local_alx_api_sync_status',
+                \local_alx_report_api\constants::TABLE_SYNC_STATUS,
                 'companyid = ?',
                 [$company->id],
                 'status, last_sync_time',
@@ -1188,12 +1746,15 @@ function local_alx_report_api_get_recent_logs($limit = 10) {
     
     $logs = [];
     
-    if ($DB->get_manager()->table_exists('local_alx_api_logs')) {
+    if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_LOGS)) {
+        // Use standard Moodle field name
+        $time_field = 'timecreated';
+        
         $sql = "SELECT l.*, c.name as company_name, u.firstname, u.lastname
                 FROM {local_alx_api_logs} l
                 LEFT JOIN {company} c ON l.companyid = c.id
                 LEFT JOIN {user} u ON l.userid = u.id
-                ORDER BY l.timecreated DESC";
+                ORDER BY l.{$time_field} DESC";
         
         $records = $DB->get_records_sql($sql, [], 0, $limit);
         
@@ -1203,7 +1764,7 @@ function local_alx_report_api_get_recent_logs($limit = 10) {
                 'action' => $record->action ?? 'API Call',
                 'user_name' => trim($record->firstname . ' ' . $record->lastname),
                 'company_name' => $record->company_name ?? 'Unknown',
-                'timestamp' => $record->timecreated,
+                'timestamp' => $record->{$time_field},
                 'status' => $record->status ?? 'success',
                 'details' => $record->details ?? ''
             ];
@@ -1341,11 +1902,11 @@ function local_alx_report_api_get_system_health() {
     
     // 2. Required tables existence and health
     $required_tables = [
-        'local_alx_api_reporting' => 'Core reporting data',
-        'local_alx_api_logs' => 'API access tracking',
-        'local_alx_api_sync_status' => 'Sync status tracking',
-        'local_alx_api_cache' => 'Performance caching',
-        'local_alx_api_settings' => 'Company configurations',
+        \local_alx_report_api\constants::TABLE_REPORTING => 'Core reporting data',
+        \local_alx_report_api\constants::TABLE_LOGS => 'API access tracking',
+        \local_alx_report_api\constants::TABLE_SYNC_STATUS => 'Sync status tracking',
+        \local_alx_report_api\constants::TABLE_CACHE => 'Performance caching',
+        \local_alx_report_api\constants::TABLE_SETTINGS => 'Company configurations',
         'external_services' => 'Web service definitions',
         'external_tokens' => 'API authentication'
     ];
@@ -1363,13 +1924,16 @@ function local_alx_report_api_get_system_health() {
                 $table_stats[$table] = ['count' => $count, 'description' => $description];
                 
                 // Check for data staleness
-                if (in_array($table, ['local_alx_api_reporting', 'local_alx_api_logs'])) {
-                    $last_update = $DB->get_field_sql("SELECT MAX(timecreated) FROM {{$table}}");
+                if (in_array($table, [\local_alx_report_api\constants::TABLE_REPORTING, \local_alx_report_api\constants::TABLE_LOGS])) {
+                    // Use standard Moodle field name
+                    $time_field = 'timecreated';
+                    
+                    $last_update = $DB->get_field_sql("SELECT MAX({$time_field}) FROM {{$table}}");
                     $age_hours = $last_update ? round((time() - $last_update) / 3600, 1) : 0;
                     $table_stats[$table]['last_update'] = $last_update;
                     $table_stats[$table]['age_hours'] = $age_hours;
                     
-                    if ($table === 'local_alx_api_logs' && $age_hours > 24) {
+                    if ($table === \local_alx_report_api\constants::TABLE_LOGS && $age_hours > 24) {
                         $health['recommendations'][] = "No API activity in {$age_hours} hours. Check if API is being used.";
                     }
                 }
@@ -1466,10 +2030,10 @@ function local_alx_report_api_get_system_health() {
     }
     
     // 5. Data quality checks
-    if ($DB->get_manager()->table_exists('local_alx_api_reporting')) {
-        $total_records = $DB->count_records('local_alx_api_reporting');
-        $active_records = $DB->count_records('local_alx_api_reporting', ['is_deleted' => 0]);
-        $stale_records = $DB->count_records_select('local_alx_api_reporting', 
+    if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_REPORTING)) {
+        $total_records = $DB->count_records(\local_alx_report_api\constants::TABLE_REPORTING);
+        $active_records = $DB->count_records(\local_alx_report_api\constants::TABLE_REPORTING, ['is_deleted' => 0]);
+        $stale_records = $DB->count_records_select(\local_alx_report_api\constants::TABLE_REPORTING, 
             'last_updated < ?', [time() - (30 * 24 * 3600)]); // 30 days old
         
         $quality_score = $total_records > 0 ? round(($active_records / $total_records) * 100, 1) : 0;
@@ -1497,12 +2061,15 @@ function local_alx_report_api_get_system_health() {
     }
     
     // 6. Performance metrics
-    if ($DB->get_manager()->table_exists('local_alx_api_logs')) {
-        $recent_calls = $DB->count_records_select('local_alx_api_logs', 
-            'timecreated > ?', [time() - 3600]); // Last hour
+    if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_LOGS)) {
+        // Use standard Moodle field name
+        $time_field = 'timecreated';
         
-        $avg_daily_calls = $DB->count_records_select('local_alx_api_logs', 
-            'timecreated > ?', [time() - (7 * 24 * 3600)]) / 7; // Weekly average
+        $recent_calls = $DB->count_records_select(\local_alx_report_api\constants::TABLE_LOGS, 
+            "{$time_field} > ?", [time() - 3600]); // Last hour
+        
+        $avg_daily_calls = $DB->count_records_select(\local_alx_report_api\constants::TABLE_LOGS, 
+            "{$time_field} > ?", [time() - (7 * 24 * 3600)]) / 7; // Weekly average
         
         $performance_status = 'ok';
         $performance_message = "Recent activity: {$recent_calls} calls/hour, {$avg_daily_calls} calls/day avg";
@@ -1574,37 +2141,49 @@ function local_alx_report_api_get_system_health() {
 function local_alx_report_api_get_api_analytics($hours = 24) {
     global $DB;
     
+    // Initialize with safe default structure
     $analytics = [
         'summary' => [
             'total_calls' => 0,
             'unique_users' => 0,
             'unique_companies' => 0,
-            'success_rate' => 0,
-            'avg_response_size' => 0,
-            'peak_hour' => null,
-            'busiest_company' => null
+            'time_period' => $hours . ' hours',
+            'calls_per_hour' => 0
         ],
         'trends' => [],
         'performance' => [],
-        'errors' => [],
-        'security' => [],
         'top_users' => [],
-        'top_companies' => []
+        'top_companies' => [],
+        'security' => []
     ];
     
-    if (!$DB->get_manager()->table_exists('local_alx_api_logs')) {
+    try {
+        // Check if logs table exists
+        if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_LOGS)) {
+            error_log('ALX Report API: local_alx_api_logs table does not exist');
+            return $analytics;
+        }
+    } catch (Exception $e) {
+        error_log('ALX Report API: Error checking table existence - ' . $e->getMessage());
         return $analytics;
     }
+    
+    try {
+    
+    // Use standard Moodle field name
+    $time_field = 'timecreated';
     
     $start_time = time() - ($hours * 3600);
     
     // 1. Basic summary statistics
-    $total_calls = $DB->count_records_select('local_alx_api_logs', 'timecreated >= ?', [$start_time]);
+    $total_calls = $DB->count_records_select(\local_alx_report_api\constants::TABLE_LOGS, "{$time_field} >= ?", [$start_time]);
     $unique_users = $DB->count_records_sql(
-        "SELECT COUNT(DISTINCT userid) FROM {local_alx_api_logs} WHERE timecreated >= ?", [$start_time]
+        "SELECT COUNT(DISTINCT userid) FROM {local_alx_api_logs} WHERE {$time_field} >= ?", [$start_time]
     );
+    
+    // Count unique companies using company_shortname field
     $unique_companies = $DB->count_records_sql(
-        "SELECT COUNT(DISTINCT companyid) FROM {local_alx_api_logs} WHERE timecreated >= ?", [$start_time]
+        "SELECT COUNT(DISTINCT company_shortname) FROM {local_alx_api_logs} WHERE {$time_field} >= ?", [$start_time]
     );
     
     $analytics['summary'] = [
@@ -1623,8 +2202,8 @@ function local_alx_report_api_get_api_analytics($hours = 24) {
     for ($i = $hours - 1; $i >= 0; $i--) {
         $hour_start = time() - (($i + 1) * 3600);
         $hour_end = time() - ($i * 3600);
-        $hour_calls = $DB->count_records_select('local_alx_api_logs', 
-            'timecreated >= ? AND timecreated < ?', [$hour_start, $hour_end]);
+        $hour_calls = $DB->count_records_select(\local_alx_report_api\constants::TABLE_LOGS, 
+            "{$time_field} >= ? AND {$time_field} < ?", [$hour_start, $hour_end]);
         
         $analytics['trends'][] = [
             'hour' => date('H:00', $hour_end),
@@ -1643,7 +2222,7 @@ function local_alx_report_api_get_api_analytics($hours = 24) {
     try {
         $response_sizes = $DB->get_records_sql(
             "SELECT id, LENGTH(response_data) as size FROM {local_alx_api_logs} 
-             WHERE timecreated >= ? AND response_data IS NOT NULL", [$start_time]
+             WHERE {$time_field} >= ? AND response_data IS NOT NULL", [$start_time]
         );
         
         if (!empty($response_sizes)) {
@@ -1665,7 +2244,7 @@ function local_alx_report_api_get_api_analytics($hours = 24) {
         "SELECT l.userid, u.firstname, u.lastname, u.username, COUNT(*) as call_count
          FROM {local_alx_api_logs} l
          LEFT JOIN {user} u ON u.id = l.userid
-         WHERE l.timecreated >= ?
+         WHERE l.{$time_field} >= ?
          GROUP BY l.userid, u.firstname, u.lastname, u.username
          ORDER BY call_count DESC
          LIMIT 10", [$start_time]
@@ -1680,24 +2259,46 @@ function local_alx_report_api_get_api_analytics($hours = 24) {
         ];
     }
     
-    // 5. Top companies by activity
-    $top_companies = $DB->get_records_sql(
-        "SELECT l.companyid, c.name, c.shortname, COUNT(*) as call_count
-         FROM {local_alx_api_logs} l
-         LEFT JOIN {company} c ON c.id = l.companyid
-         WHERE l.timecreated >= ?
-         GROUP BY l.companyid, c.name, c.shortname
-         ORDER BY call_count DESC
-         LIMIT 10", [$start_time]
-    );
-    
-    foreach ($top_companies as $company) {
-        $analytics['top_companies'][] = [
-            'company_id' => $company->companyid,
-            'name' => $company->name ?: 'Unknown',
-            'shortname' => $company->shortname,
-            'calls' => $company->call_count
-        ];
+    // 5. Top companies by activity - handle both old and new schema
+    if (isset($table_info['companyid'])) {
+        // Old schema with companyid
+        $top_companies = $DB->get_records_sql(
+            "SELECT l.companyid, c.name, c.shortname, COUNT(*) as call_count
+             FROM {local_alx_api_logs} l
+             LEFT JOIN {company} c ON c.id = l.companyid
+             WHERE l.{$time_field} >= ?
+             GROUP BY l.companyid, c.name, c.shortname
+             ORDER BY call_count DESC
+             LIMIT 10", [$start_time]
+        );
+        
+        foreach ($top_companies as $company) {
+            $analytics['top_companies'][] = [
+                'company_id' => $company->companyid,
+                'name' => $company->name ?: 'Unknown',
+                'shortname' => $company->shortname,
+                'calls' => $company->call_count
+            ];
+        }
+    } else if (isset($table_info['company_shortname'])) {
+        // New schema with company_shortname
+        $top_companies = $DB->get_records_sql(
+            "SELECT l.company_shortname, COUNT(*) as call_count
+             FROM {local_alx_api_logs} l
+             WHERE l.{$time_field} >= ? AND l.company_shortname IS NOT NULL
+             GROUP BY l.company_shortname
+             ORDER BY call_count DESC
+             LIMIT 10", [$start_time]
+        );
+        
+        foreach ($top_companies as $company) {
+            $analytics['top_companies'][] = [
+                'company_id' => 0,
+                'name' => $company->company_shortname,
+                'shortname' => $company->company_shortname,
+                'calls' => $company->call_count
+            ];
+        }
     }
     
     // Set busiest company
@@ -1710,7 +2311,7 @@ function local_alx_report_api_get_api_analytics($hours = 24) {
         $security_events = $DB->get_records_sql(
             "SELECT endpoint, COUNT(*) as count
              FROM {local_alx_api_logs}
-             WHERE timecreated >= ? AND endpoint LIKE 'security_%'
+             WHERE {$time_field} >= ? AND endpoint LIKE 'security_%'
              GROUP BY endpoint
              ORDER BY count DESC", [$start_time]
         );
@@ -1723,6 +2324,11 @@ function local_alx_report_api_get_api_analytics($hours = 24) {
         }
     } catch (Exception $e) {
         // Security tracking might not be implemented
+    }
+    
+    } catch (Exception $e) {
+        error_log('ALX Report API: Error getting API analytics - ' . $e->getMessage());
+        // Return safe default analytics structure
     }
     
     return $analytics;
@@ -1755,9 +2361,12 @@ function local_alx_report_api_get_rate_limit_monitoring() {
         'enforcement_level' => 'strict'
     ];
     
-    if (!$DB->get_manager()->table_exists('local_alx_api_logs')) {
+    if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_LOGS)) {
         return $monitoring;
     }
+    
+    // Use standard Moodle field name
+    $time_field = 'timecreated';
     
     $today_start = mktime(0, 0, 0);
     
@@ -1769,12 +2378,12 @@ function local_alx_report_api_get_rate_limit_monitoring() {
             u.lastname,
             u.username,
             COUNT(*) as requests_today,
-            MIN(l.timecreated) as first_request,
-            MAX(l.timecreated) as last_request,
-            COUNT(DISTINCT l.companyid) as companies_accessed
+            MIN(l.{$time_field}) as first_request,
+            MAX(l.{$time_field}) as last_request,
+            COUNT(DISTINCT " . (isset($table_info['companyid']) ? 'l.companyid' : 'l.company_shortname') . ") as companies_accessed
         FROM {local_alx_api_logs} l
         LEFT JOIN {user} u ON u.id = l.userid
-        WHERE l.timecreated >= ?
+        WHERE l.{$time_field} >= ?
         GROUP BY l.userid, u.firstname, u.lastname, u.username
         ORDER BY requests_today DESC
     ";
@@ -1833,13 +2442,16 @@ function local_alx_report_api_get_rate_limit_monitoring() {
         $day_start = mktime(0, 0, 0) - ($i * 24 * 3600);
         $day_end = $day_start + (24 * 3600);
         
+        // Use appropriate company field for counting
+        $company_field = isset($table_info['companyid']) ? 'companyid' : 'company_shortname';
+        
         $day_stats = $DB->get_record_sql(
             "SELECT 
                 COUNT(*) as total_requests,
                 COUNT(DISTINCT userid) as unique_users,
-                COUNT(DISTINCT companyid) as unique_companies
+                COUNT(DISTINCT {$company_field}) as unique_companies
              FROM {local_alx_api_logs}
-             WHERE timecreated >= ? AND timecreated < ?",
+             WHERE {$time_field} >= ? AND {$time_field} < ?",
             [$day_start, $day_end]
         );
         
@@ -1847,7 +2459,7 @@ function local_alx_report_api_get_rate_limit_monitoring() {
         $day_usage = $DB->get_records_sql(
             "SELECT userid, COUNT(*) as requests
              FROM {local_alx_api_logs}
-             WHERE timecreated >= ? AND timecreated < ?
+             WHERE {$time_field} >= ? AND {$time_field} < ?
              GROUP BY userid",
             [$day_start, $day_end]
         );
@@ -1905,7 +2517,7 @@ function local_alx_report_api_get_rate_limit_monitoring() {
     }
     
     return $monitoring;
-} 
+}
 
 /**
  * Send alert notifications via email and optionally SMS.
@@ -1934,6 +2546,12 @@ function local_alx_report_api_send_alert($alert_type, $severity, $message, $data
         return false; // Below threshold, don't send
     }
     
+    // Check alert cooldown to prevent spam
+    $cooldown_minutes = get_config('local_alx_report_api', 'alert_cooldown') ?: 60;
+    if (local_alx_report_api_is_alert_in_cooldown($alert_type, $severity, $cooldown_minutes)) {
+        return false; // Alert sent recently, skip to prevent spam
+    }
+    
     // Prepare alert data
     $alert = [
         'type' => $alert_type,
@@ -1956,19 +2574,14 @@ function local_alx_report_api_send_alert($alert_type, $severity, $message, $data
     $success = true;
     
     // Send email alerts
-    foreach ($recipients as $recipient) {
-        if (!empty($recipient['email'])) {
-            $email_sent = local_alx_report_api_send_email_alert($recipient, $alert);
-            if (!$email_sent) {
-                $success = false;
-            }
-        }
-        
-        // Send SMS if configured and high severity
-        if (!empty($recipient['phone']) && in_array($severity, ['high', 'critical'])) {
-            $sms_enabled = get_config('local_alx_report_api', 'enable_sms_alerts');
-            if ($sms_enabled) {
-                local_alx_report_api_send_sms_alert($recipient, $alert);
+    $email_enabled = get_config('local_alx_report_api', 'enable_email_alerts');
+    if ($email_enabled) {
+        foreach ($recipients as $recipient) {
+            if (!empty($recipient['email'])) {
+                $email_sent = local_alx_report_api_send_email_alert($recipient, $alert);
+                if (!$email_sent) {
+                    $success = false;
+                }
             }
         }
     }
@@ -2074,58 +2687,34 @@ function local_alx_report_api_send_email_alert($recipient, $alert) {
     
     // Send email using Moodle's email system
     try {
+        // Create a proper user object for email_to_user
         $user = new stdClass();
+        $user->id = -99; // Fake ID for external recipient
         $user->email = $recipient['email'];
         $user->firstname = $recipient['name'] ?? 'Administrator';
         $user->lastname = '';
+        $user->maildisplay = true;
         $user->mailformat = 1; // HTML format
+        $user->maildigest = 0;
+        $user->emailstop = 0;
+        $user->deleted = 0;
+        $user->suspended = 0;
+        $user->auth = 'manual';
         
         $from = core_user::get_noreply_user();
         
-        return email_to_user($user, $from, $subject, '', $body);
+        $result = email_to_user($user, $from, $subject, '', $body);
+        
+        // Log for debugging
+        if (!$result) {
+            error_log("ALX Report API: Failed to send email to {$recipient['email']}");
+        }
+        
+        return $result;
     } catch (Exception $e) {
-        error_log("ALX Report API: Failed to send email alert: " . $e->getMessage());
+        error_log("ALX Report API: Exception sending email alert: " . $e->getMessage());
         return false;
     }
-}
-
-/**
- * Send SMS alert (placeholder for SMS service integration).
- *
- * @param array $recipient Recipient data with phone number
- * @param array $alert Alert data
- * @return bool Success status
- */
-function local_alx_report_api_send_sms_alert($recipient, $alert) {
-    // SMS Integration placeholder - can be extended with services like:
-    // - Twilio
-    // - AWS SNS
-    // - Local SMS gateway
-    
-    $sms_service = get_config('local_alx_report_api', 'sms_service') ?: 'disabled';
-    
-    if ($sms_service === 'disabled') {
-        return false;
-    }
-    
-    $severity_icons = ['low' => 'i', 'medium' => '!', 'high' => '!!', 'critical' => '!!!'];
-    $icon = $severity_icons[$alert['severity']] ?? '!';
-    
-    $message = "ALX API {$icon} " . strtoupper($alert['severity']) . ": " . $alert['message'] . 
-               " Time: " . date('H:i', $alert['timestamp']) . 
-               " Check: " . parse_url($alert['hostname'], PHP_URL_HOST);
-    
-    // Limit SMS to 160 characters
-    if (strlen($message) > 160) {
-        $message = substr($message, 0, 157) . '...';
-    }
-    
-    // Log SMS attempt
-    error_log("ALX Report API: SMS Alert to {$recipient['phone']}: {$message}");
-    
-    // Here you would integrate with your SMS service
-    // For now, we'll return true as a placeholder
-    return true;
 }
 
 /**
@@ -2140,7 +2729,7 @@ function local_alx_report_api_get_alert_recipients($alert_type, $severity) {
     
     $recipients = [];
     
-    // Get configured alert recipients
+    // Get configured alert recipients (manual emails only)
     $alert_emails = get_config('local_alx_report_api', 'alert_emails');
     if ($alert_emails) {
         $emails = array_filter(array_map('trim', explode(',', $alert_emails)));
@@ -2148,18 +2737,6 @@ function local_alx_report_api_get_alert_recipients($alert_type, $severity) {
             if (filter_var($email, FILTER_VALIDATE_EMAIL)) {
                 $recipients[] = ['email' => $email, 'name' => 'Administrator'];
             }
-        }
-    }
-    
-    // For critical alerts, also include site admins
-    if ($severity === 'critical') {
-        $admins = get_admins();
-        foreach ($admins as $admin) {
-            $recipients[] = [
-                'email' => $admin->email,
-                'name' => fullname($admin),
-                'phone' => isset($admin->phone1) ? $admin->phone1 : null
-            ];
         }
     }
     
@@ -2215,6 +2792,36 @@ function local_alx_report_api_get_alert_recommendations($alert_type, $severity) 
 }
 
 /**
+ * Check if an alert is in cooldown period to prevent spam.
+ *
+ * @param string $alert_type Type of alert
+ * @param string $severity Severity level
+ * @param int $cooldown_minutes Cooldown period in minutes
+ * @return bool True if in cooldown, false otherwise
+ */
+function local_alx_report_api_is_alert_in_cooldown($alert_type, $severity, $cooldown_minutes) {
+    global $DB;
+    
+    if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_ALERTS)) {
+        return false;
+    }
+    
+    $cooldown_seconds = $cooldown_minutes * 60;
+    $cutoff_time = time() - $cooldown_seconds;
+    
+    // Check if same alert type and severity was sent recently
+    $recent_alert = $DB->get_record_select(
+        \local_alx_report_api\constants::TABLE_ALERTS,
+        'alert_type = ? AND severity = ? AND timecreated > ?',
+        [$alert_type, $severity, $cutoff_time],
+        'id, timecreated',
+        IGNORE_MULTIPLE
+    );
+    
+    return !empty($recent_alert);
+}
+
+/**
  * Log alert to database for tracking and reporting.
  *
  * @param array $alert Alert data
@@ -2224,7 +2831,7 @@ function local_alx_report_api_log_alert($alert) {
     global $DB;
     
     // Ensure alerts table exists
-    if (!$DB->get_manager()->table_exists('local_alx_api_alerts')) {
+    if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_ALERTS)) {
         local_alx_report_api_create_alerts_table();
     }
     
@@ -2238,7 +2845,7 @@ function local_alx_report_api_log_alert($alert) {
         $record->timecreated = $alert['timestamp'];
         $record->resolved = 0;
         
-        return $DB->insert_record('local_alx_api_alerts', $record);
+        return $DB->insert_record(\local_alx_report_api\constants::TABLE_ALERTS, $record);
     } catch (Exception $e) {
         error_log("ALX Report API: Failed to log alert: " . $e->getMessage());
         return false;
@@ -2253,8 +2860,8 @@ function local_alx_report_api_create_alerts_table() {
     
     $dbman = $DB->get_manager();
     
-    if (!$dbman->table_exists('local_alx_api_alerts')) {
-        $table = new xmldb_table('local_alx_api_alerts');
+    if (!$dbman->table_exists(\local_alx_report_api\constants::TABLE_ALERTS)) {
+        $table = new xmldb_table(\local_alx_report_api\constants::TABLE_ALERTS);
         $table->add_field('id', XMLDB_TYPE_INTEGER, '10', null, XMLDB_NOTNULL, XMLDB_SEQUENCE, null);
         $table->add_field('alert_type', XMLDB_TYPE_CHAR, '50', null, XMLDB_NOTNULL, null, null);
         $table->add_field('severity', XMLDB_TYPE_CHAR, '20', null, XMLDB_NOTNULL, null, null);
@@ -2278,6 +2885,123 @@ function local_alx_report_api_create_alerts_table() {
  * This function should be called periodically (e.g., via cron).
  */
 function local_alx_report_api_check_and_alert() {
+    global $DB, $CFG;
+    
+    // PRIORITY 1: Process existing unresolved alerts from the alerts table
+    // This is the PRIMARY purpose - send emails for alerts that were already created
+    if ($DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_ALERTS)) {
+        // Get alert settings
+        $email_alerts_enabled = get_config('local_alx_report_api', 'enable_email_alerts');
+        $alert_threshold = get_config('local_alx_report_api', 'alert_threshold') ?: 'medium';
+        
+        if ($email_alerts_enabled) {
+            // Define severity levels for filtering
+            $severity_levels = [
+                'low' => ['low', 'medium', 'high', 'critical'],
+                'medium' => ['medium', 'high', 'critical'],
+                'high' => ['high', 'critical'],
+                'critical' => ['critical']
+            ];
+            
+            $allowed_severities = $severity_levels[$alert_threshold] ?? ['medium', 'high', 'critical'];
+            
+            // Get unresolved alerts that match severity threshold
+            list($insql, $params) = $DB->get_in_or_equal($allowed_severities, SQL_PARAMS_NAMED);
+            $sql = "SELECT * FROM {" . \local_alx_report_api\constants::TABLE_ALERTS . "} 
+                    WHERE resolved = 0 
+                    AND severity $insql 
+                    ORDER BY timecreated ASC";
+            
+            $unresolved_alerts = $DB->get_records_sql($sql, $params);
+            
+            if (!empty($unresolved_alerts)) {
+                mtrace("Found " . count($unresolved_alerts) . " unresolved alerts to process");
+                
+                // Get recipients from settings
+                $alert_emails = get_config('local_alx_report_api', 'alert_emails');
+                if (empty($alert_emails)) {
+                    mtrace("No alert recipients configured in settings");
+                    return;
+                }
+                
+                $recipients = array_map('trim', explode(',', $alert_emails));
+                $cooldown_minutes = get_config('local_alx_report_api', 'alert_cooldown') ?: 60;
+                
+                foreach ($unresolved_alerts as $alert) {
+                    // Check cooldown - see if same alert type was sent recently
+                    $cooldown_check_sql = "SELECT MAX(timecreated) as last_sent 
+                                          FROM {" . \local_alx_report_api\constants::TABLE_ALERTS . "} 
+                                          WHERE alert_type = ? 
+                                          AND severity = ? 
+                                          AND resolved = 1 
+                                          AND timecreated > ?";
+                    
+                    $cooldown_time = time() - ($cooldown_minutes * 60);
+                    $recent_alert = $DB->get_record_sql($cooldown_check_sql, 
+                        [$alert->alert_type, $alert->severity, $cooldown_time]);
+                    
+                    if ($recent_alert && $recent_alert->last_sent) {
+                        mtrace("Alert {$alert->alert_type} is in cooldown period, skipping");
+                        continue;
+                    }
+                    
+                    // Send email to each recipient
+                    $sent_count = 0;
+                    foreach ($recipients as $recipient_email) {
+                        if (!empty($recipient_email) && validate_email($recipient_email)) {
+                            // Create a fake user object for email_to_user
+                            $recipient = new stdClass();
+                            $recipient->email = $recipient_email;
+                            $recipient->firstname = '';
+                            $recipient->lastname = '';
+                            $recipient->maildisplay = true;
+                            $recipient->mailformat = 1;
+                            $recipient->id = -1;
+                            $recipient->deleted = 0;
+                            $recipient->suspended = 0;
+                            
+                            // Format email
+                            $subject = "[ALX Report API] {$alert->severity} Alert: {$alert->alert_type}";
+                            
+                            $message = "Alert Details:\n\n";
+                            $message .= "Type: {$alert->alert_type}\n";
+                            $message .= "Severity: " . strtoupper($alert->severity) . "\n";
+                            $message .= "Message: {$alert->message}\n";
+                            $message .= "Hostname: {$alert->hostname}\n";
+                            $message .= "Time: " . date('Y-m-d H:i:s', $alert->timecreated) . "\n\n";
+                            $message .= "View details in Control Center:\n";
+                            $message .= $CFG->wwwroot . "/local/alx_report_api/control_center.php?tab=security\n";
+                            
+                            // Send email
+                            $from = core_user::get_noreply_user();
+                            $success = email_to_user($recipient, $from, $subject, $message);
+                            
+                            if ($success) {
+                                $sent_count++;
+                                mtrace("Sent alert email to {$recipient_email} for {$alert->alert_type}");
+                            } else {
+                                mtrace("Failed to send email to {$recipient_email}");
+                            }
+                        }
+                    }
+                    
+                    if ($sent_count > 0) {
+                        // Mark alert as resolved after sending
+                        $alert->resolved = 1;
+                        $alert->timeresolved = time();
+                        $DB->update_record(\local_alx_report_api\constants::TABLE_ALERTS, $alert);
+                        mtrace("Marked alert ID {$alert->id} as resolved");
+                    }
+                }
+            } else {
+                mtrace("No unresolved alerts found");
+            }
+        } else {
+            mtrace("Email alerts are disabled in settings");
+        }
+    }
+    
+    // PRIORITY 2: Check for NEW violations and create alerts if needed
     // Check rate limit violations
     $rate_monitoring = local_alx_report_api_get_rate_limit_monitoring();
     
@@ -2350,7 +3074,7 @@ function local_alx_report_api_get_comprehensive_analytics($hours = 24, $specific
     $since = time() - ($hours * 3600);
     
     // Base query conditions
-    $where_conditions = ['timeaccessed >= ?'];
+    $where_conditions = ['timecreated >= ?'];
     $params = [$since];
     
     if ($specific_company) {
@@ -2554,8 +3278,8 @@ function local_alx_report_api_get_comprehensive_analytics($hours = 24, $specific
             u.email
         FROM {local_alx_api_logs} l
         LEFT JOIN {user} u ON l.userid = u.id
-        WHERE l.timeaccessed >= ? AND (l.error_message IS NOT NULL AND l.error_message != '')
-        ORDER BY l.timeaccessed DESC
+        WHERE l.timecreated >= ? AND (l.error_message IS NOT NULL AND l.error_message != '')
+        ORDER BY l.timecreated DESC
         LIMIT 20
     ";
     
@@ -2647,41 +3371,7 @@ function local_alx_report_api_analyze_performance_alerts($overall_stats, $endpoi
     return $alerts;
 }
 
-/**
- * Enhanced logging function with response time and error tracking.
- */
-function local_alx_report_api_log_api_call($userid, $company_shortname, $endpoint, $record_count = 0, $error_message = null, $response_time_ms = null, $additional_data = []) {
-    global $DB;
-    
-    try {
-        $log = new stdClass();
-        $log->userid = $userid;
-        $log->company_shortname = $company_shortname;
-        $log->endpoint = $endpoint;
-        $log->record_count = $record_count;
-        $log->error_message = $error_message;
-        $log->response_time_ms = $response_time_ms;
-        $log->timeaccessed = time();
-        $log->ip_address = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
-        $log->user_agent = substr($_SERVER['HTTP_USER_AGENT'] ?? 'unknown', 0, 255);
-        
-        // Store additional data as JSON
-        if (!empty($additional_data)) {
-            $log->additional_data = json_encode($additional_data);
-        }
-        
-        $DB->insert_record('local_alx_api_logs', $log);
-        
-        // Check if this error should trigger an immediate alert
-        if ($error_message && !empty($error_message)) {
-            local_alx_report_api_check_error_alert($userid, $company_shortname, $endpoint, $error_message, $response_time_ms);
-        }
-        
-    } catch (Exception $e) {
-        // Don't let logging errors break the API
-        error_log("ALX Report API: Failed to log API call: " . $e->getMessage());
-    }
-}
+
 
 /**
  * Check if an error should trigger an immediate alert.
@@ -2709,8 +3399,8 @@ function local_alx_report_api_check_error_alert($userid, $company_shortname, $en
     }
     
     // Check error frequency (multiple errors in short time)
-    $recent_errors = $DB->count_records_select('local_alx_api_logs', 
-        'userid = ? AND endpoint = ? AND timeaccessed >= ? AND (error_message IS NOT NULL AND error_message != "")',
+    $recent_errors = $DB->count_records_select(\local_alx_report_api\constants::TABLE_LOGS, 
+        'userid = ? AND endpoint = ? AND timecreated >= ? AND (error_message IS NOT NULL AND error_message != "")',
         [$userid, $endpoint, time() - 300] // Last 5 minutes
     );
     
@@ -2747,7 +3437,7 @@ function local_alx_report_api_check_error_alert($userid, $company_shortname, $en
 function local_alx_report_api_get_api_logs_export($date_from, $date_to, $company_filter = null) {
     global $DB;
     
-    $where_conditions = ['timeaccessed >= ? AND timeaccessed <= ?'];
+    $where_conditions = ['timecreated >= ? AND timecreated <= ?'];
     $params = [$date_from, $date_to];
     
     if ($company_filter) {
@@ -3423,7 +4113,7 @@ function local_alx_report_api_get_performance_bottlenecks($hours = 24) {
             STDDEV(response_time_ms) as response_time_variance,
             COUNT(CASE WHEN response_time_ms > 1000 THEN 1 END) as slow_calls
         FROM {local_alx_api_logs}
-        WHERE timeaccessed >= ? AND response_time_ms IS NOT NULL
+        WHERE timecreated >= ? AND response_time_ms IS NOT NULL
         GROUP BY endpoint
         HAVING AVG(response_time_ms) > 500 OR COUNT(CASE WHEN response_time_ms > 1000 THEN 1 END) > 0
         ORDER BY avg_response_time DESC
@@ -3440,8 +4130,8 @@ function local_alx_report_api_get_performance_bottlenecks($hours = 24) {
             COUNT(CASE WHEN response_time_ms > 1000 THEN 1 END) as slow_calls,
             COUNT(CASE WHEN error_message IS NOT NULL AND error_message != '' THEN 1 END) as error_count
         FROM {local_alx_api_logs}
-        WHERE timeaccessed >= ?
-        GROUP BY HOUR(FROM_UNIXTIME(timeaccessed))
+        WHERE timecreated >= ?
+        GROUP BY HOUR(FROM_UNIXTIME(timecreated))
         ORDER BY hour_of_day
     ";
     $hourly_performance = $DB->get_records_sql($hourly_performance_sql, [$start_time]);
@@ -3456,7 +4146,7 @@ function local_alx_report_api_get_performance_bottlenecks($hours = 24) {
             AVG(record_count) as avg_records_per_call,
             COUNT(DISTINCT userid) as unique_users
         FROM {local_alx_api_logs}
-        WHERE timeaccessed >= ? AND company_shortname IS NOT NULL
+        WHERE timecreated >= ? AND company_shortname IS NOT NULL
         GROUP BY company_shortname
         HAVING AVG(response_time_ms) > 300 OR COUNT(CASE WHEN response_time_ms > 1000 THEN 1 END) > 5
         ORDER BY avg_response_time DESC
@@ -3477,7 +4167,7 @@ function local_alx_report_api_get_performance_bottlenecks($hours = 24) {
             SUM(record_count) as total_records_requested
         FROM {local_alx_api_logs} logs
         JOIN {user} u ON logs.userid = u.id
-        WHERE timeaccessed >= ?
+        WHERE timecreated >= ?
         GROUP BY logs.userid, logs.company_shortname
         HAVING COUNT(*) > 50 OR SUM(record_count) > 10000
         ORDER BY total_calls DESC
@@ -3497,8 +4187,8 @@ function local_alx_report_api_get_performance_bottlenecks($hours = 24) {
             COUNT(DISTINCT userid) as unique_users,
             COUNT(DISTINCT company_shortname) as unique_companies
         FROM {local_alx_api_logs}
-        WHERE timeaccessed >= ?
-        GROUP BY FROM_UNIXTIME(timeaccessed, '%Y-%m-%d %H:00:00')
+        WHERE timecreated >= ?
+        GROUP BY FROM_UNIXTIME(timecreated, '%Y-%m-%d %H:00:00')
         ORDER BY calls_count DESC
         LIMIT 10
     ";
@@ -3883,5 +4573,288 @@ function local_alx_report_api_trigger_security_alert($alert_data) {
     
     if ($message) {
         local_alx_report_api_send_alert('security', $alert_data['severity'], 'Authentication Security Alert', $message, $alert_data);
+    }
+}
+
+/**
+ * Verify ALX Report API service installation and configuration
+ * This function checks all aspects of the service setup and can fix issues automatically
+ * 
+ * @return array Detailed status report with any issues found and fixes applied
+ */
+function local_alx_report_api_verify_service_installation() {
+    global $DB;
+    
+    $issues = [];
+    $fixes_applied = [];
+    $warnings = [];
+    
+    try {
+        // 1. Check if web services are enabled
+        if (!get_config('moodle', 'enablewebservices')) {
+            $issues[] = 'Web services not enabled';
+            set_config('enablewebservices', 1);
+            $fixes_applied[] = 'Enabled web services';
+        }
+        
+        // 2. Check if REST protocol is enabled
+        $enabledprotocols = get_config('moodle', 'webserviceprotocols');
+        if (strpos($enabledprotocols, 'rest') === false) {
+            $issues[] = 'REST protocol not enabled';
+            if (empty($enabledprotocols)) {
+                set_config('webserviceprotocols', 'rest');
+            } else {
+                set_config('webserviceprotocols', $enabledprotocols . ',rest');
+            }
+            $fixes_applied[] = 'Enabled REST protocol';
+        }
+        
+        // 3. Check service exists (try both service names for compatibility)
+        $service = $DB->get_record('external_services', ['shortname' => 'alx_report_api_custom']);
+        $legacy_service = $DB->get_record('external_services', ['shortname' => 'alx_report_api']);
+        
+        if (!$service && !$legacy_service) {
+            $issues[] = 'ALX Report API service not found';
+            
+            // Create the custom service
+            $service_obj = new stdClass();
+            $service_obj->name = 'ALX Report API Service';
+            $service_obj->shortname = 'alx_report_api_custom';
+            $service_obj->enabled = 1;
+            $service_obj->restrictedusers = 1;
+            $service_obj->downloadfiles = 0;
+            $service_obj->uploadfiles = 0;
+            $service_obj->timecreated = time();
+            $service_obj->timemodified = time();
+            
+            $serviceid = $DB->insert_record('external_services', $service_obj);
+            $service = $DB->get_record('external_services', ['id' => $serviceid]);
+            $fixes_applied[] = 'Created ALX Report API service';
+        } elseif (!$service && $legacy_service) {
+            $service = $legacy_service;
+            $warnings[] = 'Using legacy service name "alx_report_api" - consider upgrading to "alx_report_api_custom"';
+        }
+        
+        // 4. Check function mapping (CRITICAL - this is the main issue you reported)
+        if ($service) {
+            $function_mapped = $DB->record_exists('external_services_functions', [
+                'externalserviceid' => $service->id,
+                'functionname' => 'local_alx_report_api_get_course_progress'
+            ]);
+            
+            if (!$function_mapped) {
+                $issues[] = 'Function not mapped to service';
+                
+                // Clear any duplicate mappings first
+                $DB->delete_records('external_services_functions', [
+                    'externalserviceid' => $service->id,
+                    'functionname' => 'local_alx_report_api_get_course_progress'
+                ]);
+                
+                // Add function mapping
+                $function = new stdClass();
+                $function->externalserviceid = $service->id;
+                $function->functionname = 'local_alx_report_api_get_course_progress';
+                $function_id = $DB->insert_record('external_services_functions', $function);
+                
+                if ($function_id) {
+                    $fixes_applied[] = 'Mapped function to service';
+                    
+                    // Verify the mapping was successful
+                    $verify_mapping = $DB->record_exists('external_services_functions', [
+                        'externalserviceid' => $service->id,
+                        'functionname' => 'local_alx_report_api_get_course_progress'
+                    ]);
+                    
+                    if (!$verify_mapping) {
+                        $issues[] = 'Function mapping verification failed - may need manual intervention';
+                    }
+                } else {
+                    $issues[] = 'Failed to create function mapping';
+                }
+            }
+        }
+        
+        // 5. Check if service is enabled
+        if ($service && !$service->enabled) {
+            $issues[] = 'Service is disabled';
+            $service->enabled = 1;
+            $service->timemodified = time();
+            $DB->update_record('external_services', $service);
+            $fixes_applied[] = 'Enabled ALX Report API service';
+        }
+        
+        // 6. Check active tokens
+        $active_tokens = 0;
+        if ($service) {
+            $active_tokens = $DB->count_records_select('external_tokens', 
+                'externalserviceid = ? AND (validuntil IS NULL OR validuntil > ?)', 
+                [$service->id, time()]
+            );
+        }
+        
+        // 7. Clear caches to ensure changes take effect
+        if (!empty($fixes_applied)) {
+            if (function_exists('cache_helper')) {
+                cache_helper::purge_by_definition('core', 'external_services');
+                cache_helper::purge_by_definition('core', 'external_functions');
+            }
+            $fixes_applied[] = 'Cleared web service caches';
+        }
+        
+        // 8. Generate service status summary
+        $service_status = [
+            'service_exists' => !empty($service),
+            'service_enabled' => $service ? (bool)$service->enabled : false,
+            'function_mapped' => $service ? $DB->record_exists('external_services_functions', [
+                'externalserviceid' => $service->id,
+                'functionname' => 'local_alx_report_api_get_course_progress'
+            ]) : false,
+            'active_tokens' => $active_tokens,
+            'webservices_enabled' => (bool)get_config('moodle', 'enablewebservices'),
+            'rest_enabled' => strpos(get_config('moodle', 'webserviceprotocols'), 'rest') !== false,
+            'service_id' => $service ? $service->id : null,
+            'service_name' => $service ? $service->shortname : null
+        ];
+        
+        return [
+            'success' => true,
+            'issues_found' => $issues,
+            'fixes_applied' => $fixes_applied,
+            'warnings' => $warnings,
+            'service_status' => $service_status,
+            'service_ready' => empty($issues) && $service_status['function_mapped'],
+            'message' => empty($issues) ? 'Service configuration verified successfully!' : 'Issues found and fixed automatically.'
+        ];
+        
+    } catch (Exception $e) {
+        return [
+            'success' => false,
+            'error' => $e->getMessage(),
+            'issues_found' => $issues,
+            'fixes_applied' => $fixes_applied,
+            'warnings' => $warnings,
+            'service_ready' => false,
+            'message' => 'Error during service verification: ' . $e->getMessage()
+        ];
+    }
+}
+
+/**
+ * Quick service status check (lightweight version for dashboard display)
+ * 
+ * @return array Basic service status information
+ */
+function local_alx_report_api_get_service_status() {
+    global $DB;
+    
+    $status = [
+        'healthy' => false,
+        'service_exists' => false,
+        'function_mapped' => false,
+        'tokens_available' => false,
+        'config_valid' => false,
+        'issues' => []
+    ];
+    
+    try {
+        // Check web services configuration
+        $webservices_enabled = get_config('moodle', 'enablewebservices');
+        $rest_enabled = strpos(get_config('moodle', 'webserviceprotocols'), 'rest') !== false;
+        $status['config_valid'] = $webservices_enabled && $rest_enabled;
+        
+        if (!$webservices_enabled) {
+            $status['issues'][] = 'Web services disabled';
+        }
+        if (!$rest_enabled) {
+            $status['issues'][] = 'REST protocol disabled';
+        }
+        
+        // Check service exists
+        $service = $DB->get_record('external_services', ['shortname' => 'alx_report_api_custom']);
+        if (!$service) {
+            $service = $DB->get_record('external_services', ['shortname' => 'alx_report_api']);
+        }
+        
+        $status['service_exists'] = !empty($service);
+        if (!$service) {
+            $status['issues'][] = 'API service not found';
+            return $status;
+        }
+        
+        // Check function mapping
+        $status['function_mapped'] = $DB->record_exists('external_services_functions', [
+            'externalserviceid' => $service->id,
+            'functionname' => 'local_alx_report_api_get_course_progress'
+        ]);
+        
+        if (!$status['function_mapped']) {
+            $status['issues'][] = 'Function not mapped to service';
+        }
+        
+        // Check active tokens
+        $active_tokens = $DB->count_records_select('external_tokens', 
+            'externalserviceid = ? AND (validuntil IS NULL OR validuntil > ?)', 
+            [$service->id, time()]
+        );
+        $status['tokens_available'] = $active_tokens > 0;
+        
+        if ($active_tokens == 0) {
+            $status['issues'][] = 'No active API tokens';
+        }
+        
+        // Overall health assessment
+        $status['healthy'] = $status['config_valid'] && $status['service_exists'] && 
+                           $status['function_mapped'] && $status['tokens_available'];
+        
+        return $status;
+        
+    } catch (Exception $e) {
+        $status['issues'][] = 'Error checking service status: ' . $e->getMessage();
+        return $status;
+    }
+}
+
+/**
+ * Log an API call to the logs table.
+ *
+ * @param int $userid User ID making the call
+ * @param string $company_shortname Company shortname
+ * @param string $endpoint API endpoint called
+ * @param int $record_count Number of records returned
+ * @param string|null $error_message Error message if any
+ * @param float|null $response_time_ms Response time in milliseconds
+ * @param array $additional_data Additional data to log
+ */
+function local_alx_report_api_log_api_call($userid, $company_shortname, $endpoint, $record_count = 0, 
+    $error_message = null, $response_time_ms = null, $additional_data = []) {
+    global $DB;
+
+    try {
+        if (!$DB->get_manager()->table_exists(\local_alx_report_api\constants::TABLE_LOGS)) {
+            return;
+        }
+
+        $log = new stdClass();
+        $log->userid = $userid;
+        $log->company_shortname = $company_shortname;
+        $log->endpoint = $endpoint;
+        $log->record_count = $record_count;
+        $log->error_message = $error_message;
+        $log->response_time_ms = $response_time_ms;
+        $log->timecreated = time(); // Fixed: Use timecreated instead of timeaccessed
+        $log->ip_address = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        $log->user_agent = substr($_SERVER['HTTP_USER_AGENT'] ?? 'unknown', 0, 255);
+
+        // Store additional data as JSON
+        if (!empty($additional_data)) {
+            $log->additional_data = json_encode($additional_data);
+        }
+
+        $DB->insert_record(\local_alx_report_api\constants::TABLE_LOGS, $log);
+
+    } catch (Exception $e) {
+        // Don't let logging errors break the API
+        error_log("ALX Report API: Failed to log API call: " . $e->getMessage());
     }
 }

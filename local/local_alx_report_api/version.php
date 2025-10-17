@@ -25,7 +25,7 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'local_alx_report_api';
-$plugin->version = 2024062404; // YYYYMMDDHH - Added MEDIUM PRIORITY features: Historical trends, bottleneck identification, auth logging
+$plugin->version   = 2024101704; // Version 1.9.0 release
 $plugin->requires = 2022112800; // Moodle 4.2.6
 $plugin->maturity = MATURITY_STABLE;
-$plugin->release = '1.3.0'; 
+$plugin->release = '1.9.0'; // Main branch established with latest code 
